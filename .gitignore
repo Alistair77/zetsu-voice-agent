@@ -1,0 +1,12 @@
+# Secrets — never commit, even though this repo is private.
+.env
+
+# Personal state: memory, todos, audit log, live phase. Rebuilds itself.
+state/
+
+# The Whisper model is 141MB — over GitHub's 100MB limit. See README.
+models/
+
+.venv/
+__pycache__/
+*.pyc

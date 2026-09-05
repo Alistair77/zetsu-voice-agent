@@ -1,0 +1,114 @@
+# Zetsu configuration. Edit these, not the code.
+
+[agent]
+name = "Zetsu"
+tone = """
+You are warm, plain-spoken and brief. No preamble, no filler, no restating the
+question. Say the thing. You will often be heard rather than read, so keep replies
+short enough to listen to and skip formatting that only works on a page.
+"""
+purpose = """
+You are a personal daily driver — you help keep track of the day, notes and general
+life admin — and a hands-free dev copilot for the projects being worked on.
+"""
+
+[model]
+# Local brain via Ollama. No API key, no rate limit, nothing leaves this Mac.
+# Bigger = smarter but slower; 7b is the next step up if 3b gets sloppy at Tier 2.
+backend = "auto"        # "ollama" (fast, free) | "claude-cli" (smart, paid) | "auto" (route per turn)
+name = "qwen2.5:3b"
+host = "http://localhost:11434"
+timeout_seconds = 120
+cli_model = "sonnet"    # only used when backend = "claude-cli"
+keep_alive = "30m"   # how long Ollama holds the model in RAM between turns
+
+[router]
+# Only used when backend = "auto". Fast and free by default; pay for the CLI
+# when the ask actually wants a bigger model. Tune these freely.
+force_prefix = "!"          # start a message with ! to always use Claude
+escalate_over_chars = 280   # long, detailed asks are rarely simple
+escalate_on = [
+  "code", "script", "debug", "refactor", "function", "error", "stack trace",
+  "browse", "web", "search online", "url", "download",
+  "sort", "organise", "organize", "rename", "clean up", "file",
+  "analyse", "analyze", "compare", "plan", "draft", "write a", "explain why",
+]
+
+[notes]
+# Where search_notes looks. Read-only.
+roots = ["~/Desktop", "~/Documents"]
+extensions = [".md", ".txt", ".org"]
+max_results = 20
+timeout_seconds = 15
+
+[tools]
+# How many tool calls one turn may chain before Zetsu has to answer.
+max_steps = 5
+
+[voice]
+# Ears: whisper.cpp, on-device. Nothing spoken here leaves this Mac.
+whisper_model = "models/ggml-base.en.bin"
+transcribe_timeout = 60
+mic = ":0"           # ffmpeg avfoundation audio device — see `ffmpeg -f avfoundation -list_devices true -i ""`
+max_seconds = 60     # hard cap on one recording
+
+# Mouth: macOS `say`, built in. More voices: System Settings > Accessibility >
+# Spoken Content > System Voice > Manage Voices.
+say_voice = "Samantha"
+say_rate = 190
+
+[memory]
+# Durable facts live in state/memory.md — plain text, edit it by hand any time.
+load_limit = 40      # most recent facts loaded into the prompt each conversation
+
+[heartbeat]
+# Tier 5: acts without being spoken to. `enabled = false` is the kill switch —
+# it's re-read every tick, so flipping it stops things without a restart.
+enabled = true
+interval_seconds = 900   # how often it checks for anything worth saying
+quiet_start = "22:00"    # nothing is said in this window, only queued
+quiet_end = "07:00"
+
+[gate]
+# Tools that send, spend, delete, write or run anything stop and ask first.
+# That is decided in code, so a new consequential tool is gated by default.
+# List a tool here to let it run unattended - this is the only way to loosen it.
+unattended = []      # e.g. ["remember"] once memory prompts get tiresome
+
+[audit]
+# Plain log of what ran and why: state/audit.log. `/audit` shows the tail.
+log_tokens = true    # per-turn token counts, so a runaway loop is visible
+
+[dash]
+# Local-only status page: http://localhost:8765
+port = 8765
+audit_lines = 40
+
+[wake]
+# Open-mic wake word. Push-to-talk (--voice) stays the reliable path; this sits
+# on top of it. Everything is transcribed locally — nothing is uploaded, and
+# nothing is kept: each chunk is deleted as soon as it has been read.
+phrase = "Friday"
+# What whisper actually hears when you say it. Add your own near-misses.
+variants = ["friday", "fry day", "freeday", "free day", "fridays", "friday s"]
+# How close a near-miss has to be to count (0-1). Lower wakes more easily but
+# also on things you did not say. Raise it if it starts triggering on its own.
+similarity = 0.78
+takes = 3                # how many samples `--calibrate` records
+chunk_seconds = 2.5      # how long each listening slice is
+show_chunks = true      # print every slice it hears — for debugging the mic
+command_seconds = 6      # how long you get to speak after it wakes
+
+# After it replies it keeps listening this long, so you can just answer a
+# follow-up question instead of saying the wake word again. Silence past this
+# and it goes back to sleep.
+follow_up_seconds = 12
+
+# Say any of these and it stays awake indefinitely — for a long conversation.
+stay_awake = ["long conversation", "lets talk", "lets chat", "keep listening",
+              "stay awake", "stay with me", "dont go to sleep", "keep the mic on"]
+
+# Say any of these and it goes back to sleep until the wake word.
+goodbyes = ["bye bye", "goodbye", "im done for the day", "im done for today",
+            "stop listening", "thats all for now", "go to sleep", "that is all",
+            "im finished", "we are done"]
