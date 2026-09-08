@@ -382,13 +382,12 @@ def _save_variants(variants):
 # it must never hear itself, and the wake word can land across a chunk boundary.
 
 def wake_main():
-    """Open mic, with a conversation that stays open.
+    """Open mic, continuous. No slices, no device handover.
 
-    Asleep it listens only for the wake word. Once awake it keeps listening
-    after every reply, so a follow-up question can just be answered — having to
-    say the wake word between every sentence is not a conversation. Silence ends
-    it, or you can ask it to stay awake for as long as you like and close with
-    "bye bye".
+    One audio stream runs for the whole session and frames are measured as they
+    arrive, so a turn ends when you stop talking rather than when a fixed window
+    closes. That was worth 2865ms down to roughly 650ms — every processing stage
+    was already inside budget; the waiting was the cost.
     """
     import ears
     import mouth
@@ -398,29 +397,39 @@ def wake_main():
 
     settings = CONFIG["wake"]
     phrase = settings["phrase"]
+
+    if CONFIG["voice"]["use_server"]:
+        print("Loading the speech model (once — everything after this is fast)…")
+        print("  ready." if ears.start_server() else "  falling back to per-chunk loading.")
+
     speaker = mouth.Speaker()
-    history = []
+    mic = ears.StreamMic(prompt=phrase)
+    history, marks = [], {}
 
-    mic = None
+    def note_timing():
+        if mic.speech_ended:
+            marks["speech_end"] = mic.speech_ended
+            marks["endpoint"] = mic.speech_ended
+        if mic.transcript_at:
+            marks["stt"] = mic.transcript_at
 
-    def mic_on():
-        nonlocal mic
-        if mic is None:
-            mic = ears.OpenMic(settings["chunk_seconds"], phrase)
-
-    def mic_off():
-        """Go deaf. Called before Zetsu speaks, so it cannot hear itself."""
-        nonlocal mic
-        if mic is not None:
-            mic.close()
-            mic = None
+    def listen(deadline=None, timed=True):
+        try:
+            heard = mic.next_utterance(deadline)
+        except RuntimeError as exc:
+            rails.log("MIC", f"stream fault: {exc}")
+            print(f"    ‹mic stream stopped: {exc}›")
+            return ""
+        if timed:
+            # Barge-in polls must not stamp the marks, or a later listen
+            # overwrites the transcript time and the report reads negative.
+            note_timing()
+        if heard and settings.get("show_chunks"):
+            print(f"    ‹heard› {heard!r}")
+        return heard
 
     def pending_notices():
-        """Say anything the heartbeat has been holding, while the mic is live.
-
-        It could only ever print these before. If you are in the room and it is
-        listening, it should be able to tell you.
-        """
+        """Say anything the heartbeat is holding, while the mic is live."""
         if speaker.is_busy() or rails.is_paused():
             return False
         import heartbeat
@@ -428,101 +437,33 @@ def wake_main():
         delivered = heartbeat.deliver_pending(speaker.say_now)
         if delivered:
             speaker.wait()
+            mic.flush()
         return bool(delivered)
 
-    def listen_for(_seconds=None):
-        """One slice of audio, as text. A bad slice is skipped, never fatal.
-
-        Losing a chunk costs you a second; letting the exception out ends the
-        conversation. The recorder is rebuilt on the next call.
-        """
-        nonlocal mic
-        try:
-            mic_on()
-            chunk = mic.next_chunk(_seconds)
-        except Exception as exc:
-            rails.log("MIC", f"chunk dropped: {type(exc).__name__}: {exc}")
-            print("    ‹mic hiccup — skipping a slice›")
-            # Close before discarding. Dropping the reference alone leaves an
-            # ffmpeg holding the device, so every retry fails too and one
-            # transient hiccup becomes a dead microphone for the whole session.
-            try:
-                if mic is not None:
-                    mic.close()
-            except Exception:
-                pass
-            mic = None
-            return ""
-        if settings.get("show_chunks") and chunk:
-            print(f"    ‹heard› {chunk!r}")
-        return chunk
-
-    def hear_a_sentence(deadline, opening=""):
-        """Collect speech across chunks until a quiet one ends the sentence.
-
-        Chunked so a short answer comes back fast, but a chunk with speech in it
-        is always followed by another — otherwise it would cut you off mid
-        sentence every two and a half seconds.
-        """
-        parts = [opening] if opening else []
-        mic_on()
-        while True:
-            chunk = listen_for(settings["awake_chunk_seconds"])
-            if chunk:
-                parts.append(chunk)
-                marks["speech_end"] = time.time()
-                # If this slice already ended in silence, they have stopped —
-                # end the turn here. Waiting for a whole further silent slice
-                # was 1670ms of the old 2865ms turn, for no information.
-                if mic is not None and mic.tail_is_quiet():
-                    marks["endpoint"] = time.time()
-                    collected = ears.stitch(parts).strip()
-                    marks["stt"] = time.time()
-                    return collected
-                continue
-            if parts:
-                marks["endpoint"] = time.time()
-                collected = ears.stitch(parts).strip()
-                marks["stt"] = time.time()
-                return collected
-            if time.time() > deadline:
-                return ""
-            if rails.is_paused():
-                return ""
-
-    # The gate runs on the MAIN thread, never the worker.
-    #
-    # It used to call input() from inside the turn's thread. With the mic live,
-    # answering "yes" out loud was heard as a barge-in: it cancelled the turn,
-    # the tool never ran, and the thread stayed blocked on input() forever,
-    # swallowing the next line typed. So the worker only *asks*; the main loop,
-    # which already owns the microphone, does the listening and answers back.
+    # The gate runs on the MAIN thread, never the worker — it owns the mic, and
+    # a worker blocked on input() while you answer out loud deadlocks.
     gate = {"summary": None, "allowed": False}
-    gate_asked = threading.Event()
-    gate_answered = threading.Event()
+    gate_asked, gate_answered = threading.Event(), threading.Event()
 
     def confirm_aloud(summary):
-        """Called on the worker thread. Hands the question to the main loop."""
         gate["summary"] = summary
         gate_answered.clear()
         gate_asked.set()
         if not gate_answered.wait(timeout=settings["confirm_timeout"] + 15):
-            return False  # nobody answered; never assume permission
+            return False   # nobody answered; never assume permission
         return gate["allowed"]
 
     def settle_gate():
-        """Main thread: ask out loud, listen for yes or no, default to no."""
         summary = gate["summary"]
-        spoken_name = summary.split("(")[0].replace("_", " ")
         print(f"\n  ⚠︎  {NAME} wants to: {summary}")
         speaker.stop()
-        speaker.say_now(f"I want to {spoken_name}. Say yes or no.")
+        speaker.say_now(f"I want to {summary.split('(')[0].replace('_', ' ')}. Say yes or no.")
         speaker.wait()
+        mic.flush()
 
-        deadline = time.time() + settings["confirm_timeout"]
-        allowed = False
+        deadline, allowed = time.time() + settings["confirm_timeout"], False
         while time.time() < deadline:
-            reply = listen_for(settings["awake_chunk_seconds"])
+            reply = listen(deadline, timed=False)
             if not reply or speaker.sounds_like_me(reply):
                 continue
             if ears.matches_any(reply, settings["yes_words"]):
@@ -532,6 +473,7 @@ def wake_main():
                 break
             speaker.say_now("Yes or no?")
             speaker.wait()
+            mic.flush()
 
         print(f"      {'allowed' if allowed else 'denied'} by voice\n")
         if not allowed:
@@ -540,16 +482,7 @@ def wake_main():
         gate_answered.set()
 
     def answer(said):
-        """Answer one turn, while retaining the microphone for barge-in.
-
-        This is deliberately different from the old half-duplex loop. The
-        recorder that was already rolling when the user stopped talking remains
-        alive through generation and playback. A new utterance cancels both the
-        TTS process and Ollama's stream, then becomes the next turn.
-
-        A laptop speaker feeds its own speech back into a microphone, so this is
-        intended for headphones until an acoustic echo canceller is added.
-        """
+        """Answer one turn while staying open to being talked over."""
         print(f"you › {said}")
         print(f"{NAME} › ", end="", flush=True)
         speaker.reset_timing()
@@ -557,31 +490,25 @@ def wake_main():
         outcome = {"error": None}
 
         def on_delta(piece):
-            # A response can have one last network chunk in flight after an
-            # interruption. Do not allow it back into the speech queue.
             if interrupted.is_set():
                 return
             marks.setdefault("first_token", time.time())
             print(piece, end="", flush=True)
             speaker.feed(piece)
 
-        def streaming_response(messages, specs, on_delta, cfg=None, backend=None):
-            return brain.respond(
-                messages, specs, on_delta, cfg, backend,
-                cancelled=interrupted.is_set,
-            )
+        def streaming_response(messages, specs, deltas, cfg=None, backend=None):
+            return brain.respond(messages, specs, deltas, cfg, backend,
+                                 cancelled=interrupted.is_set)
 
         def run_turn():
             try:
-                turn(
-                    streaming_response, history, said,
-                    on_delta=on_delta,
-                    on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
-                    confirm=confirm_aloud,
-                    on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
-                    backend_override=CONFIG["voice"].get("backend"),
-                    cancelled=interrupted.is_set,
-                )
+                turn(streaming_response, history, said,
+                     on_delta=on_delta,
+                     on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
+                     confirm=confirm_aloud,
+                     on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
+                     backend_override=CONFIG["voice"].get("backend"),
+                     cancelled=interrupted.is_set)
             except brain.ResponseInterrupted:
                 pass
             except Exception as exc:
@@ -594,140 +521,95 @@ def wake_main():
         worker.start()
 
         if not settings.get("barge_in", False):
-            # Retain the old safe half-duplex behavior for anyone using laptop
-            # speakers, where speech recognition would otherwise hear `say`.
-            mic_off()
+            mic.muted = True
             while worker.is_alive():
                 if gate_asked.is_set():
                     gate_asked.clear()
-                    mic_on()
+                    mic.muted = False
                     settle_gate()
-                    mic_off()
+                    mic.muted = True
                 worker.join(timeout=0.2)
             speaker.wait()
-            mic_on()
+            mic.muted = False
+            mic.flush()
         else:
-            minimum_words = settings.get("barge_in_min_words", 1)
-            # Stay live through both generation *and* queued playback. The
-            # latter is where most "I said stop but it kept talking" failures
-            # come from.
+            minimum = settings.get("barge_in_min_words", 2)
             while worker.is_alive() or speaker.is_busy():
                 if gate_asked.is_set():
                     gate_asked.clear()
                     settle_gate()
                     continue
-                chunk = listen_for(settings["awake_chunk_seconds"])
-                # While it is actually talking, demand more words before
-                # believing an interruption. Its own speech comes back as short
-                # mangled fragments ("4 10 a.m." from "before 10am") that no
-                # echo test catches reliably.
-                needed = minimum_words if not speaker.is_busy() else max(
-                    minimum_words, settings["barge_in_while_speaking_words"]
-                )
-                if len(chunk.split()) < needed:
+                mic.duck_db = settings["barge_in_duck_db"] if speaker.is_busy() else 0.0
+                heard = listen(time.time() + 0.4, timed=False)
+                if not heard:
                     continue
-                if speaker.sounds_like_me(chunk):
-                    # Its own voice coming back through the speakers. Without
-                    # this it interrupts itself mid-sentence.
+                # While it is speaking, demand more words: its own voice returns
+                # as short mangled fragments no echo test catches reliably.
+                needed = minimum if not speaker.is_busy() else max(
+                    minimum, settings["barge_in_while_speaking_words"])
+                if len(heard.split()) < needed or speaker.sounds_like_me(heard):
                     continue
+                mic.duck_db = 0.0
                 interrupted.set()
                 speaker.stop()
                 worker.join(timeout=2)
                 print("\n  ↳ interrupted")
-                # `OpenMic` has already started the following recording before
-                # transcribing this chunk, so collecting the rest introduces no
-                # new recording gap.
-                return hear_a_sentence(time.time() + settings["follow_up_seconds"], chunk)
+                return heard
             worker.join()
+            mic.duck_db = 0.0
 
         if outcome["error"]:
             speaker.stop()
             print(f"\n[couldn't reach the brain: {outcome['error']}]\n")
             return ""
         print("\n")
+        speaker.wait()
+        mic.flush()   # drop whatever it heard of itself
         return ""
 
-    if CONFIG["voice"]["use_server"]:
-        print("Loading the speech model (once — everything after this is fast)…")
-        if ears.start_server():
-            print("  ready.\n")
-        else:
-            print("  couldn't start it; falling back to per-chunk loading.\n")
-
-    print(f'Open mic. Say "{phrase}" to wake me.')
-    print(f'Once awake I keep listening for {settings["follow_up_seconds"]}s after each reply.')
+    print(f'\nOpen mic. Say "{phrase}" to wake me.')
+    print(f'I keep listening for {settings["follow_up_seconds"]}s after each reply.')
     print('Ask me to "keep listening" to stay awake, and "bye bye" to stop.\n')
     live.claim_mic()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
-    carry, awake, staying, pending = "", False, False, ""
-    marks = {}
+    awake = staying = False
+    pending = ""
     try:
         while True:
             if rails.is_paused():
-                mic_off()
                 live.set_phase("idle")
                 awake = staying = False
                 time.sleep(2)
                 continue
-            if speaker.is_busy():
-                time.sleep(0.2)
-                continue
 
             if not awake:
                 live.set_phase("listening", f'asleep — say "{phrase}"')
-                chunk = listen_for(settings["chunk_seconds"])
-                spoken = ears.find_wake(f"{carry} {chunk}")
-                carry = " ".join(chunk.split()[-3:])
+                heard = listen()
+                if not heard:
+                    continue
+                spoken = ears.find_wake(heard)
                 if spoken is None:
-                    # Remember what *nearly* woke it. These are the spellings
-                    # your voice actually produces, and `--misses` turns them
-                    # into variants you can add without guessing.
-                    near = ears.best_near_miss(chunk)
+                    near = ears.best_near_miss(heard)
                     if near and settings["similarity"] - 0.22 <= near[1] < settings["similarity"]:
                         rails.log("WAKE-MISS", f"{near[0]!r} ({near[1]:.2f})")
-                    if pending_notices():
-                        continue
+                    pending_notices()
                     continue
-                carry, awake = "", True
+                awake = True
                 print(f'  ◉ awake ("{phrase}")')
                 if len(spoken.split()) < 2:
-                    # Keep listening first. Saying "Yes?" here turns the mic off,
-                    # and people say the wake word and the question in one breath
-                    # — the question lands in that gap and is lost. Only prompt
-                    # if they genuinely said nothing after the name.
-                    spoken = hear_a_sentence(
-                        time.time() + settings["awake_chunk_seconds"] * 2
-                    )
-                    # Overlapping slices mean the name often reappears at the
-                    # head of the sentence. Strip it, or the model is asked
-                    # "Friday, what is on my list" and tries to interpret it.
-                    trimmed = ears.find_wake(spoken)
-                    if trimmed:
-                        spoken = trimmed
-                    if not spoken:
-                        mic_off()
-                        speaker.say_now("Yes?")
-                        speaker.wait()
-                        mic_on()
-                else:
-                    # Finish hearing the sentence before answering it. Taking the
-                    # wake slice as the whole question truncates it ("what is on
-                    # my") and the rest of what you were saying then arrives as
-                    # an interruption of the answer you did not want yet.
-                    spoken = hear_a_sentence(
-                        time.time() + settings["awake_chunk_seconds"] * 2, spoken
-                    )
+                    speaker.say_now("Yes?")
+                    speaker.wait()
+                    mic.flush()
+                    spoken = ""
             else:
                 spoken, pending = pending, ""
 
             if not spoken:
-                marks.clear()
-                until = float("inf") if staying else time.time() + settings["follow_up_seconds"]
+                until = None if staying else time.time() + settings["follow_up_seconds"]
                 live.set_phase("listening", "in conversation — go ahead"
                                if staying else "listening for your reply")
-                print("  ● listening…")
-                spoken = hear_a_sentence(until)
+                spoken = listen(until)
 
             if not spoken:
                 print(f'  ○ back to sleep — say "{phrase}" to wake me\n')
@@ -737,9 +619,9 @@ def wake_main():
 
             if ears.matches_any(spoken, settings["goodbyes"]):
                 print(f'  ○ "{spoken}" — back to sleep\n')
-                mic_off()
                 speaker.say_now("Alright. Say my name when you need me.")
                 speaker.wait()
+                mic.flush()
                 awake = staying = False
                 live.set_phase("idle")
                 continue
@@ -757,7 +639,7 @@ def wake_main():
     except KeyboardInterrupt:
         print()
     finally:
-        mic_off()
+        mic.close()
         live.release_mic()
     speaker.close()
     live.set_phase("idle")

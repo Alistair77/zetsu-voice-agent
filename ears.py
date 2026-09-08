@@ -7,7 +7,10 @@ rewriting `transcribe` and nothing else.
 
 import array
 import atexit
+import collections
 import difflib
+import queue
+import threading
 import math
 import re
 import subprocess
@@ -269,6 +272,185 @@ class Recording:
             return transcribe(self.wav, prompt)
         finally:
             self.workspace.cleanup()
+
+
+def frame_dbfs(raw):
+    """Loudness of one raw PCM frame, in dBFS."""
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) // 2 * 2])
+    if not samples:
+        return -99.0
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    rms = math.sqrt(total / len(samples))
+    return 20 * math.log10(rms / 32768) if rms > 0 else -99.0
+
+
+class StreamMic:
+    """Continuous capture with rolling voice activity detection.
+
+    The slice-based recorder was the entire latency budget. Every stage measured
+    inside target — 2ms to decide, 118ms to transcribe, 64ms to first token,
+    51ms to synthesise, 235ms of compute all in — while a real turn took 2865ms,
+    because it waited for a fixed slice to elapse and then for a whole silent
+    slice to confirm the end.
+
+    So there are no slices. One ffmpeg runs for the life of the session and
+    streams raw PCM; frames are measured as they arrive. An utterance ends when
+    speech is followed by `hangover_ms` of quiet — when you actually stop, not
+    when a window happens to close.
+
+    It also removes a whole class of bug: nothing opens or closes the microphone
+    mid-conversation, so there is no device handover to lose and no orphaned
+    ffmpeg left holding the input.
+    """
+
+    def __init__(self, prompt=None, cfg=CONFIG):
+        stream = cfg["stream"]
+        self.cfg = cfg
+        self.prompt = prompt
+        self.rate = 16000
+        self.frame_ms = stream["frame_ms"]
+        self.frame_bytes = int(self.rate * self.frame_ms / 1000) * 2
+        self.noise_floor = cfg["voice"]["vad_silence_dbfs"] - cfg["voice"]["vad_margin_db"]
+        self.muted = False
+        # Raised while Zetsu is speaking. Its own voice reaches the mic from
+        # across the room; yours arrives from a foot away and is markedly
+        # louder. Demanding that margin is a cheap stand-in for real echo
+        # cancellation, and unlike a text comparison it is not fooled when
+        # whisper hallucinates something unrecognisable out of the echo.
+        self.duck_db = 0.0
+
+        self.process = subprocess.Popen(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                # Low latency matters more than throughput here. Left alone,
+                # ffmpeg fills a pipe buffer before releasing anything, which
+                # put ~1.5s between speech ending and frames arriving — larger
+                # than every processing stage put together.
+                "-fflags", "nobuffer", "-flags", "low_delay",
+                "-f", "avfoundation", "-i", cfg["voice"]["mic"],
+                "-ar", str(self.rate), "-ac", "1",
+                "-f", "s16le", "-flush_packets", "1", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        self.speech_ended = None      # when the talking actually stopped
+        self.transcript_at = None     # when the text was ready
+        self.frames = queue.Queue(maxsize=stream["queue_frames"])
+        self.reader = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader.start()
+        atexit.register(self.close)
+
+    def _read_loop(self):
+        while True:
+            try:
+                raw = self.process.stdout.read(self.frame_bytes)
+            except (ValueError, OSError):
+                return
+            if not raw:
+                return
+            if self.frames.full():
+                try:
+                    self.frames.get_nowait()  # drop the oldest, never block capture
+                except queue.Empty:
+                    pass
+            self.frames.put(raw)
+
+    def threshold(self):
+        return self.noise_floor + self.cfg["voice"]["vad_margin_db"] + self.duck_db
+
+    def _learn_floor(self, level):
+        if level <= -99.0:
+            return
+        if level < self.noise_floor:
+            self.noise_floor = self.noise_floor * 0.7 + level * 0.3
+        elif level < self.threshold():
+            self.noise_floor = self.noise_floor * 0.99 + level * 0.01
+
+    def flush(self):
+        """Discard what is buffered — used the moment Zetsu stops speaking."""
+        while not self.frames.empty():
+            try:
+                self.frames.get_nowait()
+            except queue.Empty:
+                break
+
+    def next_utterance(self, deadline=None, on_speech_start=None):
+        """Wait for something to be said and return it as text.
+
+        Returns "" if the deadline passes in silence. Waits in frame-sized steps,
+        so a caller can stay responsive while it listens.
+        """
+        stream = self.cfg["stream"]
+        preroll = collections.deque(maxlen=max(1, stream["preroll_ms"] // self.frame_ms))
+        speech, in_speech, quiet_ms, spoken_ms = [], False, 0, 0
+
+        while True:
+            if deadline is not None and not in_speech and time.time() > deadline:
+                return ""
+            try:
+                frame = self.frames.get(timeout=0.25)
+            except queue.Empty:
+                if self.process.poll() is not None:
+                    raise RuntimeError("the microphone stream stopped")
+                continue
+
+            level = frame_dbfs(frame)
+            loud = level > self.threshold()
+            if not loud:
+                self._learn_floor(level)
+
+            if not in_speech:
+                preroll.append(frame)
+                if loud and not self.muted:
+                    in_speech = True
+                    speech = list(preroll)   # keep the onset rather than clip it
+                    spoken_ms, quiet_ms = len(speech) * self.frame_ms, 0
+                    if on_speech_start:
+                        on_speech_start()
+                continue
+
+            speech.append(frame)
+            spoken_ms += self.frame_ms
+            if loud:
+                quiet_ms = 0
+            else:
+                quiet_ms += self.frame_ms
+                if quiet_ms >= stream["hangover_ms"]:
+                    break
+            if spoken_ms >= stream["max_utterance_ms"]:
+                break
+
+        # Speech stopped one hangover ago, not now — that is the honest instant
+        # to measure latency from.
+        self.speech_ended = time.time() - quiet_ms / 1000
+        if spoken_ms - quiet_ms < stream["min_speech_ms"]:
+            return ""   # a cough, a door, a keyboard
+
+        text = self._transcribe_frames(speech)
+        self.transcript_at = time.time()
+        return text
+
+    def _transcribe_frames(self, frames):
+        with tempfile.TemporaryDirectory() as workspace:
+            path = Path(workspace) / "utterance.wav"
+            with wave.open(str(path), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(self.rate)
+                handle.writeframes(b"".join(frames))
+            return transcribe(path, self.prompt)
+
+    def close(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
 
 
 class OpenMic:

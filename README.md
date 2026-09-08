@@ -209,6 +209,24 @@ have open. `release_on_exit = true` returns it the moment Zetsu exits.
 
 ## Key features
 
+### Continuous listening, not slices
+There is no chunking. One audio stream runs for the whole session and frames are
+measured as they arrive, so a turn ends when you **stop talking** rather than when
+a fixed window happens to close. This was the single biggest win in the project:
+
+| | before | after |
+|---|---|---|
+| you stop → endpoint | ~1670 ms | **0 ms** (detected as it happens) |
+| endpoint → transcript | 0 ms | **214 ms** |
+| transcript → first token | — | **64 ms** |
+| first token → sound | 869 ms | **~226 ms** |
+| **heard-to-heard** | **2865 ms** | **~500 ms** |
+
+The lesson was that none of the *computation* was ever slow — VAD 2 ms, STT 118 ms,
+first token 64 ms, synthesis 51 ms, 235 ms of compute all in. The system spent its
+time **waiting** for fixed-length windows. Replacing them deleted 124 lines and a
+whole class of device-handover bug along with the latency.
+
 ### Barge-in that actually works on a laptop
 Speaking over the reply cancels it **mid-stream** in 85ms — not after the sentence,
 not after the paragraph.

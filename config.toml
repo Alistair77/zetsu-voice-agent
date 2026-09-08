@@ -166,6 +166,10 @@ barge_in_min_words = 2
 # Words needed to interrupt *while it is still speaking*. Higher than the normal
 # bar, because its own voice returns as short mangled fragments.
 barge_in_while_speaking_words = 4
+# How much louder than the room you must be to interrupt while it is talking.
+# Its voice crosses the room; yours is a foot from the mic. Raise it if it still
+# interrupts itself on speakers, lower it if it ignores you on headphones.
+barge_in_duck_db = 18
 
 confirm_timeout = 15
 yes_words = ["yes", "yeah", "yep", "yup", "sure", "go ahead", "do it", "okay", "ok", "please do"]
@@ -194,3 +198,14 @@ stt_ms = 250             # audio -> text
 first_token_ms = 350     # text -> model starts answering
 first_audio_ms = 150     # first token -> sound leaves the speakers
 total_ms = 800           # heard-to-heard
+
+[stream]
+# Continuous capture. There are no slices: one ffmpeg runs for the session and
+# frames are measured as they arrive, so an utterance ends when you stop talking
+# rather than when a fixed window happens to close.
+frame_ms = 20            # granularity of the energy decision
+preroll_ms = 300         # audio kept from before speech began, so onsets survive
+hangover_ms = 400        # silence after speech before the turn is called over
+min_speech_ms = 250      # anything shorter is a cough, not a sentence
+max_utterance_ms = 20000 # hard stop, in case the silence never arrives
+queue_frames = 500       # ~10s of buffer; oldest dropped rather than blocking
