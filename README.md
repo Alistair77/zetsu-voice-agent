@@ -270,6 +270,17 @@ fired into the void, respect quiet hours, and can now be **spoken aloud** when t
 mic is live. `/pause` — or Mute on the dashboard — stops all of it without tearing
 anything down.
 
+### A voice that sounds like a person
+Speech runs through **Piper**, a neural voice that runs locally — no account, no
+network, no per-word cost. Its model is loaded once and kept in memory: 0.07–0.24s a
+sentence, against 0.95s if reloaded each time. `say` remains the automatic fallback.
+
+### It can reach your actual life
+Beyond its own todo list, it reads your **real calendar**, reads and writes **Apple
+Reminders** (so things reach your phone), and reports on the machine itself — battery,
+disk, time. Calendar and reminder *writes* are gated like everything else
+consequential; reads run free.
+
 ### A dashboard that shows what it is doing
 `--dash` serves a local page with a WebGL ring that reflects the live state: still
 when idle, cyan listening, violet hearing you, amber thinking (with elapsed time and
@@ -318,7 +329,9 @@ Console commands while talking: `/pause` `/resume` `/audit` `/status` `/quit`.
 | `dash.py` | the local page |
 | `config.py` | settings and paths, in one place |
 
-**Zero third-party Python dependencies.** Standard library plus local binaries.
+**One optional Python dependency** (`piper-tts`, for the neural voice) plus local
+binaries. Everything else is the standard library — and if Piper is missing, speech
+falls back to the built-in `say` rather than failing.
 
 Every provider sits behind a one-function seam. Swapping Ollama for something else,
 or `say` for a neural voice, is a rewrite of one function — not a refactor.
@@ -337,6 +350,14 @@ or `say` for a neural voice, is a rewrite of one function — not a refactor.
 ```bash
 brew install ffmpeg whisper-cpp
 ollama pull qwen2.5:3b
+
+# the neural voice (optional — it falls back to the system voice without it)
+.venv/bin/pip install piper-tts
+mkdir -p models/piper
+curl -L -o models/piper/en_US-amy-medium.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+curl -L -o models/piper/en_US-amy-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
 
 # the Whisper model is not in this repo — it is 141MB, over GitHub's file limit
 mkdir -p models
@@ -361,6 +382,13 @@ which tools require confirmation. You will tune these often; none of it should e
 require touching code.
 
 `AGENT.md` records what was built, in what order, and why.
+
+## RAM
+
+The language model is ~2.2 GB resident. On an 8 GB machine that matters, so it is
+**handed back the moment Zetsu exits** (`release_on_exit`). Ollama does not run at
+login, so nothing is held when you are not using it. Check with `ollama ps` — empty
+means nothing loaded.
 
 ## A note on headphones
 

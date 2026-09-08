@@ -10,7 +10,7 @@ asking"). Tier 6 hardens that gate; the flag is load-bearing from day one.
 
 import json
 import subprocess
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import memory
@@ -208,6 +208,128 @@ def recall():
     if not current:
         return "Nothing remembered yet."
     return "\n".join(f"{i}. {fact}" for i, fact in enumerate(current, 1))
+
+
+# --- the world outside this program ------------------------------------------
+# Read-only lookups run free. Anything that writes to a real calendar or a real
+# reminder list is gated like every other consequential action.
+
+def _osascript(script, timeout=25):
+    result = subprocess.run(
+        ["osascript", "-e", script], capture_output=True, text=True, timeout=timeout
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else ""
+        if "not allowed" in message or "-1743" in message:
+            raise RuntimeError(
+                "macOS has not granted access to that app. Approve it in System "
+                "Settings > Privacy & Security > Automation, then ask again."
+            )
+        raise RuntimeError(message or "the app did not respond")
+    return result.stdout.strip()
+
+
+CALENDAR_ON = """
+set dayStart to (current date) - (time of (current date)) + ({offset} * days)
+set dayEnd to dayStart + (1 * days)
+set output to ""
+tell application "Calendar"
+  repeat with cal in calendars
+    repeat with evt in (every event of cal whose start date is greater than or equal to dayStart and start date is less than dayEnd)
+      set output to output & (summary of evt) & " at " & (time string of (start date of evt)) & linefeed
+    end repeat
+  end repeat
+end tell
+return output
+"""
+
+
+@tool(
+    "Look at the user's real calendar. Use this whenever they ask what is on, "
+    "what they have coming up, whether they are free, or about a meeting.",
+    when_opt="'today' or 'tomorrow'. Defaults to today.",
+)
+def whats_on(when="today"):
+    offset = 1 if str(when).lower().startswith("tomorrow") else 0
+    found = _osascript(CALENDAR_ON.format(offset=offset), timeout=40)
+    label = "tomorrow" if offset else "today"
+    if not found:
+        return f"Nothing in the calendar for {label}."
+    return f"On the calendar for {label}:\n{found}"
+
+
+@tool(
+    "Add a real event to the user's calendar. Only for actual appointments — use "
+    "add_todo for tasks that are not at a fixed time.",
+    confirm=True,
+    title="What the event is called.",
+    start="When it starts, as YYYY-MM-DD HH:MM in 24-hour time.",
+    minutes_opt="How long it lasts in minutes. Defaults to 60.",
+)
+def add_calendar_event(title, start, minutes="60"):
+    try:
+        when = datetime.strptime(start.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return f"I could not read {start!r} as a date. Use YYYY-MM-DD HH:MM."
+    length = int(str(minutes) or 60)
+    stamp = when.strftime("%-m/%-d/%Y %-I:%M:%S %p")
+    safe = title.replace('"', "'")
+    _osascript(
+        f'tell application "Calendar" to tell calendar 1 to make new event '
+        f'with properties {{summary:"{safe}", start date:date "{stamp}", '
+        f'end date:(date "{stamp}") + {length} * minutes}}'
+    )
+    return f"Added {title!r} on {when:%A %d %B at %H:%M}."
+
+
+@tool(
+    "Read the user's Apple Reminders — the ones that sync to their phone. Use "
+    "this when they ask about reminders rather than this program's own todo list.",
+)
+def apple_reminders():
+    found = _osascript(
+        'tell application "Reminders" to get name of every reminder of list 1 '
+        "whose completed is false",
+        timeout=30,
+    )
+    if not found:
+        return "No open reminders on the phone."
+    return "On the phone:\n" + "\n".join(f"- {r.strip()}" for r in found.split(","))
+
+
+@tool(
+    "Add a reminder to Apple Reminders so it reaches the user's phone. Use this "
+    "when they want to be reminded away from this machine.",
+    confirm=True,
+    text="What the reminder says.",
+)
+def add_apple_reminder(text):
+    safe = text.replace('"', "'")
+    _osascript(
+        f'tell application "Reminders" to make new reminder at end of list 1 '
+        f'with properties {{name:"{safe}"}}'
+    )
+    return f"Added to your phone: {text}"
+
+
+@tool(
+    "Check this machine — battery, storage and the time. Use when the user asks "
+    "how the laptop is doing, or about battery or disk space.",
+)
+def system_status():
+    battery = subprocess.run(
+        ["pmset", "-g", "batt"], capture_output=True, text=True, timeout=10
+    ).stdout
+    percent = next((w for w in battery.split() if w.endswith("%;")), "?").rstrip(";")
+    charging = "charging" if "AC Power" in battery else "on battery"
+    disk = subprocess.run(
+        ["df", "-h", "/System/Volumes/Data"], capture_output=True, text=True, timeout=10
+    ).stdout.splitlines()
+    free = disk[1].split()[3] if len(disk) > 1 else "?"
+    return (
+        f"Battery {percent} ({charging}). {free} of disk free. "
+        f"It is {datetime.now():%H:%M on %A %d %B}."
+    )
 
 
 # --- running them ------------------------------------------------------------

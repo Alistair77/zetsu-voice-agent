@@ -276,7 +276,7 @@ def voice_main():
             speaker.stop()
             print(f"\n[couldn't reach the brain: {exc}]\n")
 
-    speaker.stop()
+    speaker.close()
     _release()
     print(f"{NAME} out.")
 
@@ -677,11 +677,24 @@ def wake_main():
                 carry, awake = "", True
                 print(f'  ◉ awake ("{phrase}")')
                 if len(spoken.split()) < 2:
-                    mic_off()
-                    speaker.say_now("Yes?")
-                    speaker.wait()
-                    mic_on()
-                    spoken = ""
+                    # Keep listening first. Saying "Yes?" here turns the mic off,
+                    # and people say the wake word and the question in one breath
+                    # — the question lands in that gap and is lost. Only prompt
+                    # if they genuinely said nothing after the name.
+                    spoken = hear_a_sentence(
+                        time.time() + settings["awake_chunk_seconds"] * 2
+                    )
+                    # Overlapping slices mean the name often reappears at the
+                    # head of the sentence. Strip it, or the model is asked
+                    # "Friday, what is on my list" and tries to interpret it.
+                    trimmed = ears.find_wake(spoken)
+                    if trimmed:
+                        spoken = trimmed
+                    if not spoken:
+                        mic_off()
+                        speaker.say_now("Yes?")
+                        speaker.wait()
+                        mic_on()
                 else:
                     # Finish hearing the sentence before answering it. Taking the
                     # wake slice as the whole question truncates it ("what is on
@@ -726,7 +739,7 @@ def wake_main():
     finally:
         mic_off()
         live.release_mic()
-    speaker.stop()
+    speaker.close()
     live.set_phase("idle")
     _release()
     print(f"{NAME} out.")

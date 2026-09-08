@@ -71,7 +71,13 @@ backend = "ollama"
 # boundary rather than waiting indefinitely for its full stop.
 speak_chunk_chars = 120
 
-# Mouth: macOS `say`, built in. More voices: System Settings > Accessibility >
+# Mouth. "piper" is a local neural voice — natural, still entirely offline, model
+# held in memory. "say" is the macOS built-in: instant, always available, robotic.
+# If the Piper model is missing it falls back to `say` on its own.
+engine = "piper"
+piper_model = "models/piper/en_US-amy-medium.onnx"
+
+# Only used by the `say` engine. More voices: System Settings > Accessibility >
 # Spoken Content > System Voice > Manage Voices.
 # How long the mouth remembers what it said, so the ears can discard their own
 # echo instead of treating it as you interrupting.

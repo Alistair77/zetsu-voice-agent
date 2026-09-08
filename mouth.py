@@ -1,18 +1,27 @@
-"""The mouth. Text out loud through macOS `say`.
+"""The mouth. Text out loud.
 
 Seam: give it text, it speaks. Sentences are spoken as soon as they are complete,
 so Zetsu starts talking while the rest of the reply is still being written.
 Swapping in a different voice engine means rewriting `_say` and nothing else.
+
+Two engines. Piper is a local neural voice — it sounds like a person, and its
+model is loaded once and kept in memory (0.07-0.24s a sentence; reloading it
+each time costs 0.95s, the same trap whisper had). macOS `say` is the fallback:
+instant, always present, unmistakably a robot. If Piper is missing or fails to
+load, speech degrades to `say` rather than going silent.
 """
 
 import difflib
 import queue
 import re
 import subprocess
+import tempfile
 import threading
 import time
+import wave
+from pathlib import Path
 
-from config import CONFIG
+from config import CONFIG, ROOT
 
 # Speak on sentence boundaries — waiting for the whole reply is what makes an
 # assistant feel laggy. A long first sentence is still a bad voice UI, though,
@@ -45,8 +54,24 @@ class Speaker:
         self.echo = []
         self.echo_seconds = cfg["voice"].get("echo_memory_seconds", 20)
         self.echo_threshold = cfg["voice"].get("echo_threshold", 0.45)
+        self.engine = cfg["voice"].get("engine", "say")
+        self.piper = self._load_piper() if self.engine == "piper" else None
         self.worker = threading.Thread(target=self._drain, daemon=True)
         self.worker.start()
+
+    def _load_piper(self):
+        """Load the neural voice once. Falling back is better than falling over."""
+        try:
+            from piper import PiperVoice
+
+            model = ROOT / CONFIG["voice"]["piper_model"]
+            if not model.exists():
+                print(f"  [voice] {model.name} missing — using the system voice")
+                return None
+            return PiperVoice.load(str(model))
+        except Exception as exc:
+            print(f"  [voice] neural voice unavailable ({exc}) — using the system voice")
+            return None
 
     def remember_saying(self, text):
         now = time.time()
@@ -91,14 +116,44 @@ class Speaker:
         )
 
     def _say(self, text):
+        """The engine seam. Everything above this is engine-agnostic."""
         self.remember_saying(text)
+        try:
+            if self.piper is not None:
+                self._speak_neural(text)
+            else:
+                self._speak_system(text)
+        finally:
+            self.current = None
+
+    def _speak_system(self, text):
         self.current = subprocess.Popen(
             ["say", "-v", self.voice, "-r", self.rate, text],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         self.current.wait()
-        self.current = None
+
+    def _speak_neural(self, text):
+        """Synthesise to a file, then play it. Deleted straight after.
+
+        Kept as a separate process for playback specifically so `stop()` can
+        terminate it — barge-in has to be able to cut a sentence off mid-word.
+        """
+        with tempfile.TemporaryDirectory() as workspace:
+            path = Path(workspace) / "say.wav"
+            try:
+                with wave.open(str(path), "wb") as handle:
+                    self.piper.synthesize_wav(text, handle)
+            except Exception:
+                self._speak_system(text)  # synthesis failed; still say it
+                return
+            self.current = subprocess.Popen(
+                ["afplay", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.current.wait()
 
     def _drain(self):
         while True:
@@ -152,6 +207,20 @@ class Speaker:
         hears Zetsu say its own name and answers itself, forever.
         """
         return bool(self.buffer) or not self.queue.empty() or self.current is not None
+
+    def close(self):
+        """Shut the speech thread down before the interpreter exits.
+
+        The neural voice holds an ONNX session. Letting Python tear down while
+        the worker still owns it aborts the process on the way out
+        ("recursive_mutex lock failed"), which looks like a crash to anyone
+        reading the terminal. Stop, drain, join, release — in that order.
+        """
+        self.stop()
+        self.queue.put(None)
+        if self.worker.is_alive():
+            self.worker.join(timeout=3)
+        self.piper = None
 
     def stop(self):
         """Shut up immediately. The user starting a new turn always wins."""
