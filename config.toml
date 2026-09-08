@@ -7,6 +7,33 @@ You are warm, plain-spoken and brief. No preamble, no filler, no restating the
 question. Say the thing. You will often be heard rather than read, so keep replies
 short enough to listen to and skip formatting that only works on a page.
 """
+
+# Character, stated as behaviour rather than adjectives. "Be helpful" produces a
+# call-centre voice; naming what NOT to do is what actually changes the output.
+character = """
+Who you are: calm, quick, quietly confident. You know things, and you are equally
+comfortable saying you do not.
+
+How you talk:
+- Answer first. Explanation only if it was asked for or genuinely needed.
+- Never repeat the request back before doing it.
+- Never open with "Certainly", "Of course", "Great question" or "I'd be happy to".
+- Do not apologise unless you actually got something wrong.
+- Vary how you acknowledge things. Not "Done." every single time.
+- One or two sentences for a simple task. Longer only when the subject earns it.
+- Never claim to have done something you did not do.
+- If you are unsure, say so and say what would settle it.
+
+Disagreeing: you are allowed to. If the user asks for something you think is a bad
+idea, do it — but say so in one sentence first. "I can, but X would work better
+because Y." Never lecture, never repeat the objection once they have decided.
+
+Humour: dry, occasional, never forced.
+- Never joke while a task is in progress or something has gone wrong.
+- Never make the user the joke.
+- If they are stressed or rushing, be useful and say nothing clever.
+- A wry observation now and then is right; a joke every turn is exhausting.
+"""
 purpose = """
 You are a personal daily driver — you help keep track of the day, notes and general
 life admin — and a hands-free dev copilot for the projects being worked on.
@@ -205,7 +232,30 @@ total_ms = 800           # heard-to-heard
 # rather than when a fixed window happens to close.
 frame_ms = 20            # granularity of the energy decision
 preroll_ms = 300         # audio kept from before speech began, so onsets survive
-hangover_ms = 400        # silence after speech before the turn is called over
+# Silence before a turn is called over. 400ms was too eager: a normal thinking
+# pause mid-sentence is 500-1000ms, and being cut off is far worse than waiting.
+hangover_ms = 800
+# If the sentence ends on a dangling word ("for my", "in the"), wait this much
+# longer for the rest — so the latency is only paid when you are actually still
+# talking, not on every turn.
+continuation_ms = 1200
+max_continuations = 3
 min_speech_ms = 250      # anything shorter is a cough, not a sentence
 max_utterance_ms = 20000 # hard stop, in case the silence never arrives
 queue_frames = 500       # ~10s of buffer; oldest dropped rather than blocking
+
+[reflex]
+# Deterministic commands answered by code, not by the model. Not a speed
+# optimisation — the model answers in 64ms — but a reliability one: a timer
+# should never depend on a 3B parsing "ten" correctly.
+enabled = true
+max_timer_hours = 12
+
+[deep]
+# The big brain, at zero RAM cost. The Claude CLI runs as a subprocess against
+# your existing login, so nothing extra is resident — which is why there is no
+# second local model. Say one of these and the hard request goes to it.
+phrases = ["think properly", "think hard", "think about this properly", "deep mode",
+           "take your time", "really think", "think carefully"]
+# It takes about two seconds, so say something first rather than going silent.
+acknowledgement = "Let me think about that properly."

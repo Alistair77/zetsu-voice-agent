@@ -343,7 +343,7 @@ def run(name, arguments, confirmer):
     summary = f"{name}(" + ", ".join(f"{k}={v!r}" for k, v in arguments.items()) + ")"
     if not entry:
         rails.log("UNKNOWN", summary)
-        return f"There is no tool called {name!r}."
+        return f"[FAILED] There is no tool called {name!r}. Nothing happened."
 
     if rails.needs_confirm(name, entry["confirm"]):
         if not confirmer(summary):
@@ -351,7 +351,7 @@ def run(name, arguments, confirmer):
             # Say it loudly. A small model will otherwise breeze past a soft refusal
             # and cheerfully report success for something that never happened.
             return (
-                f"BLOCKED. The user said NO to {name}. It did NOT run and NOTHING "
+                f"[BLOCKED] The user said NO to {name}. It did NOT run and NOTHING "
                 "changed. You must tell the user plainly that you did not do it. "
                 "Do not claim it succeeded. Do not try it again unless they ask."
             )
@@ -359,14 +359,17 @@ def run(name, arguments, confirmer):
     else:
         rails.log("RAN", summary)
 
+    # Whether an action worked is decided here, by what actually happened — never
+    # by the model reading a hopeful-sounding string. Every result is stamped, and
+    # the system prompt forbids claiming success without an [OK].
     try:
-        result = str(entry["function"](**arguments))
+        result = f"[OK] {entry['function'](**arguments)}"
     except TypeError as exc:
         rails.log("FAILED", f"{summary} -> bad arguments: {exc}")
-        return f"Wrong arguments for {name}: {exc}"
+        return f"[FAILED] {name} was called wrongly: {exc}. Nothing happened."
     except Exception as exc:
         rails.log("FAILED", f"{summary} -> {exc}")
-        return f"{name} failed: {exc}"
+        return f"[FAILED] {name} did not work: {exc}. Nothing happened."
 
     if entry["screen"]:
         result, caught = rails.screen(result, name)

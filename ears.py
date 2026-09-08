@@ -630,3 +630,27 @@ def best_near_miss(text, cfg=CONFIG):
                 if ratio > best[1]:
                     best = (window, ratio)
     return best if best[0] else None
+
+
+# Words that almost never end a sentence. If the transcript stops on one of
+# these, the speaker is mid-thought — "remind me to make an advertisement for my
+# mother's name change document" ... "in the newspaper". Ending the turn on a
+# fixed silence cuts that in half. Grammatical incompleteness is a cheap, strong
+# signal that someone is still going.
+DANGLING = {
+    "a", "an", "the", "and", "or", "but", "so", "then", "of", "to", "for",
+    "with", "at", "in", "on", "by", "from", "about", "into", "onto", "over",
+    "under", "my", "your", "our", "their", "his", "her", "its", "this", "that",
+    "these", "those", "is", "are", "was", "were", "be", "been", "being", "am",
+    "do", "does", "did", "have", "has", "had", "will", "would", "can", "could",
+    "should", "shall", "may", "might", "must", "if", "when", "while", "because",
+    "before", "after", "some", "any", "every", "very", "really", "just", "like",
+}
+
+
+def sounds_unfinished(text):
+    """True if this looks like someone stopping to think, not stopping."""
+    words = normalise(text).split()
+    if not words:
+        return False
+    return words[-1] in DANGLING

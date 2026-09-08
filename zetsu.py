@@ -20,6 +20,7 @@ import time
 import brain
 import live
 import rails
+import reflex
 import tools
 from config import CONFIG, NAME
 
@@ -156,6 +157,10 @@ def main():
         if text in ("/quit", "/exit"):
             break
         if handle_command(text):
+            continue
+
+        if instant := reflex.handle(text):
+            print(f"{NAME} › {instant}\n")
             continue
 
         print(f"{NAME} › ", end="", flush=True)
@@ -413,13 +418,33 @@ def wake_main():
         if mic.transcript_at:
             marks["stt"] = mic.transcript_at
 
-    def listen(deadline=None, timed=True):
+    def listen(deadline=None, timed=True, allow_continuation=True):
+        """One utterance. Waits longer when the sentence is clearly unfinished.
+
+        A fixed silence is the wrong way to decide someone has stopped talking.
+        People pause mid-sentence to think, and cutting them off there is worse
+        than any latency this saves — so if the transcript ends on a dangling
+        word, listen again and join the pieces.
+        """
         try:
             heard = mic.next_utterance(deadline)
         except RuntimeError as exc:
             rails.log("MIC", f"stream fault: {exc}")
             print(f"    ‹mic stream stopped: {exc}›")
             return ""
+
+        if allow_continuation and heard:
+            grace = CONFIG["stream"]["continuation_ms"] / 1000
+            for _ in range(CONFIG["stream"]["max_continuations"]):
+                if not ears.sounds_unfinished(heard):
+                    break
+                if settings.get("show_chunks"):
+                    print(f"    ‹…still going: {heard.split()[-1]!r}›")
+                more = mic.next_utterance(time.time() + grace)
+                if not more:
+                    break
+                heard = f"{heard} {more}".strip()
+
         if timed:
             # Barge-in polls must not stamp the marks, or a later listen
             # overwrites the transcript time and the report reads negative.
@@ -484,6 +509,22 @@ def wake_main():
     def answer(said):
         """Answer one turn while staying open to being talked over."""
         print(f"you › {said}")
+
+        # Deterministic commands never reach the model. Timers speak for
+        # themselves when they fire, through the same voice.
+        if instant := reflex.handle(said, on_fire=lambda text: speaker.say_now(text)):
+            print(f"{NAME} › {instant}\n")
+            speaker.reset_timing()
+            speaker.say_now(instant)
+            speaker.wait()
+            mic.flush()
+            return ""
+
+        # The big brain takes about two seconds. Say something rather than
+        # leaving a silence that reads as a failure.
+        if brain.wants_deep(said):
+            speaker.say_now(CONFIG["deep"]["acknowledgement"])
+
         print(f"{NAME} › ", end="", flush=True)
         speaker.reset_timing()
         interrupted = threading.Event()
@@ -809,8 +850,10 @@ def selftest():
     assert not echoing.sounds_like_me("yes")  # too short to judge on overlap
 
     # 5. a broken tool returns an explanation, it does not raise
-    assert "no tool called" in tools.run("nope", {}, allow)
-    assert "Wrong arguments" in tools.run("list_todos", {"bogus": 1}, allow)
+    # Outcomes are stamped by the tool, never inferred by the model
+    assert tools.run("nope", {}, allow).startswith("[FAILED]")
+    assert tools.run("list_todos", {"bogus": 1}, allow).startswith("[FAILED]")
+    assert tools.run("list_todos", {}, allow).startswith("[OK]")
 
     # 6. the mouth speaks whole sentences as they complete, never half of one
     import mouth
