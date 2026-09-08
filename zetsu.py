@@ -470,9 +470,13 @@ def wake_main():
             chunk = listen_for(settings["awake_chunk_seconds"])
             if chunk:
                 parts.append(chunk)
+                marks["speech_end"] = time.time()
                 continue
             if parts:
-                return ears.stitch(parts).strip()
+                marks["endpoint"] = time.time()
+                collected = ears.stitch(parts).strip()
+                marks["stt"] = time.time()
+                return collected
             if time.time() > deadline:
                 return ""
             if rails.is_paused():
@@ -540,6 +544,7 @@ def wake_main():
         """
         print(f"you › {said}")
         print(f"{NAME} › ", end="", flush=True)
+        speaker.reset_timing()
         interrupted = threading.Event()
         outcome = {"error": None}
 
@@ -548,6 +553,7 @@ def wake_main():
             # interruption. Do not allow it back into the speech queue.
             if interrupted.is_set():
                 return
+            marks.setdefault("first_token", time.time())
             print(piece, end="", flush=True)
             speaker.feed(piece)
 
@@ -647,6 +653,7 @@ def wake_main():
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
     carry, awake, staying, pending = "", False, False, ""
+    marks = {}
     try:
         while True:
             if rails.is_paused():
@@ -707,6 +714,7 @@ def wake_main():
                 spoken, pending = pending, ""
 
             if not spoken:
+                marks.clear()
                 until = float("inf") if staying else time.time() + settings["follow_up_seconds"]
                 live.set_phase("listening", "in conversation — go ahead"
                                if staying else "listening for your reply")
@@ -734,6 +742,10 @@ def wake_main():
                 rails.log("MIC", "staying awake for a long conversation")
 
             pending = answer(spoken)
+            if speaker.first_audio:
+                marks["first_audio"] = speaker.first_audio
+                report_stages(marks, speaker)
+            marks.clear()
     except KeyboardInterrupt:
         print()
     finally:
@@ -763,6 +775,32 @@ def misses_main():
     for phrase, times in counts.most_common(12):
         print(f"  {times:>3}x  {phrase!r}   closest {best[phrase]:.2f}")
     print("\nAdd the ones that were really you, to [wake] variants in config.toml.")
+
+
+def report_stages(marks, speaker):
+    """Where a turn's time actually went. Guessing is how you optimise the
+    wrong stage — this prints the whole chain, per turn, with the budget."""
+    budget = CONFIG["latency"]
+    order = [
+        ("you stop talking → endpoint", "speech_end", "endpoint", budget["endpoint_ms"]),
+        ("endpoint → transcript", "endpoint", "stt", budget["stt_ms"]),
+        ("transcript → first token", "stt", "first_token", budget["first_token_ms"]),
+        ("first token → sound", "first_token", "first_audio", budget["first_audio_ms"]),
+    ]
+    if "speech_end" not in marks or "first_audio" not in marks:
+        return
+    print("\n  ── where the time went ──")
+    total = 0.0
+    for label, start, end, cap in order:
+        if start not in marks or end not in marks:
+            continue
+        took = (marks[end] - marks[start]) * 1000
+        total += took
+        flag = "ok " if took <= cap else "OVER"
+        print(f"    {flag} {label:<30} {took:7.0f} ms   (budget {cap})")
+    print(f"        {'total, heard-to-heard':<30} {total:7.0f} ms   "
+          f"(target {budget['total_ms']})")
+    rails.log("LATENCY", f"{total:.0f}ms total")
 
 
 def _release():

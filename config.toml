@@ -171,3 +171,13 @@ stay_awake = ["long conversation", "lets talk", "lets chat", "keep listening",
 goodbyes = ["bye bye", "goodbye", "im done for the day", "im done for today",
             "stop listening", "thats all for now", "go to sleep", "that is all",
             "im finished", "we are done"]
+
+[latency]
+# A budget, not a wish. Every voice turn is measured against these and anything
+# over is printed as OVER. The point is to know which stage to fix, not to make
+# a vague plea for speed.
+endpoint_ms = 400        # you stop talking -> it notices
+stt_ms = 250             # audio -> text
+first_token_ms = 350     # text -> model starts answering
+first_audio_ms = 150     # first token -> sound leaves the speakers
+total_ms = 800           # heard-to-heard

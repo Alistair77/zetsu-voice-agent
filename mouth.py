@@ -54,6 +54,7 @@ class Speaker:
         self.echo = []
         self.echo_seconds = cfg["voice"].get("echo_memory_seconds", 20)
         self.echo_threshold = cfg["voice"].get("echo_threshold", 0.45)
+        self.first_audio = None   # when sound actually reached the speakers
         self.engine = cfg["voice"].get("engine", "say")
         self.piper = self._load_piper() if self.engine == "piper" else None
         self.worker = threading.Thread(target=self._drain, daemon=True)
@@ -115,6 +116,9 @@ class Speaker:
             for said in recent
         )
 
+    def reset_timing(self):
+        self.first_audio = None
+
     def _say(self, text):
         """The engine seam. Everything above this is engine-agnostic."""
         self.remember_saying(text)
@@ -127,6 +131,8 @@ class Speaker:
             self.current = None
 
     def _speak_system(self, text):
+        if self.first_audio is None:
+            self.first_audio = time.time()
         self.current = subprocess.Popen(
             ["say", "-v", self.voice, "-r", self.rate, text],
             stdout=subprocess.DEVNULL,
@@ -148,6 +154,8 @@ class Speaker:
             except Exception:
                 self._speak_system(text)  # synthesis failed; still say it
                 return
+            if self.first_audio is None:
+                self.first_audio = time.time()
             self.current = subprocess.Popen(
                 ["afplay", str(path)],
                 stdout=subprocess.DEVNULL,
