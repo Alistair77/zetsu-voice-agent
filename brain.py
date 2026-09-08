@@ -15,6 +15,10 @@ import rails
 from config import CONFIG
 
 
+class ResponseInterrupted(Exception):
+    """The caller stopped a streamed response because the user spoke again."""
+
+
 def system_prompt(cfg=CONFIG):
     return (
         f"Your name is {cfg['agent']['name']}.\n"
@@ -53,18 +57,18 @@ def route(text, cfg=CONFIG):
     return "ollama", "simple enough"
 
 
-def respond(history, tools, on_delta, cfg=CONFIG, backend=None):
+def respond(history, tools, on_delta, cfg=CONFIG, backend=None, cancelled=None):
     """Send the conversation, get the reply. The seam everything else calls.
 
     Returns the assistant message: {"role", "content", and maybe "tool_calls"}.
     """
     backend = backend or cfg["model"]["backend"]
     if backend == "claude-cli":
-        return claude_cli_respond(history, tools, on_delta, cfg)
-    return ollama_respond(history, tools, on_delta, cfg)
+        return claude_cli_respond(history, tools, on_delta, cfg, cancelled)
+    return ollama_respond(history, tools, on_delta, cfg, cancelled)
 
 
-def ollama_respond(history, tools, on_delta, cfg=CONFIG):
+def ollama_respond(history, tools, on_delta, cfg=CONFIG, cancelled=None):
     """Local brain. Streams token by token, free, offline."""
     model = cfg["model"]
     payload = {
@@ -87,6 +91,11 @@ def ollama_respond(history, tools, on_delta, cfg=CONFIG):
     chunks, tool_calls = [], []
     with urllib.request.urlopen(request, timeout=model["timeout_seconds"]) as response:
         for line in response:  # newline-delimited JSON, roughly one per token
+            # Do this in the streaming loop instead of only after the model has
+            # finished. Closing the turn at the next token is what makes a
+            # spoken interruption feel immediate rather than queued.
+            if cancelled and cancelled():
+                raise ResponseInterrupted()
             if not line.strip():
                 continue
             event = json.loads(line)
@@ -155,7 +164,7 @@ def _transcript(history):
     return "\n\n".join(lines)
 
 
-def claude_cli_respond(history, tools, on_delta, cfg=CONFIG):
+def claude_cli_respond(history, tools, on_delta, cfg=CONFIG, cancelled=None):
     model = cfg["model"]
     system = system_prompt(cfg)
     if tools:
@@ -176,6 +185,8 @@ def claude_cli_respond(history, tools, on_delta, cfg=CONFIG):
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip()[:200] or "claude CLI failed")
+    if cancelled and cancelled():
+        raise ResponseInterrupted()
 
     payload = json.loads(result.stdout)
     text = (payload.get("result") or "").strip()
@@ -193,6 +204,30 @@ def claude_cli_respond(history, tools, on_delta, cfg=CONFIG):
 
     on_delta(text)
     return {"role": "assistant", "content": text}
+
+
+def unload(cfg=CONFIG):
+    """Hand the model's RAM back. Called on the way out of every mode.
+
+    Ollama keeps a model resident for `keep_alive` after the last request —
+    2.2GB of an 8GB machine, sitting idle long after you have stopped talking.
+    Warm while you are using it is the whole point; warm while you are not is
+    just a tax on everything else you have open.
+    """
+    if cfg["model"]["backend"] == "claude-cli" or not cfg["model"]["release_on_exit"]:
+        return False
+    payload = json.dumps({"model": cfg["model"]["name"], "keep_alive": 0}).encode()
+    request = urllib.request.Request(
+        f"{cfg['model']['host']}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10):
+            rails.log("MODEL", "released — RAM handed back")
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def check(cfg=CONFIG):

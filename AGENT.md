@@ -50,6 +50,22 @@ dropped in later by rewriting one function.
   it actually gets heard as — run `--calibrate` to learn yours from three samples of your
   own voice, and `show_chunks = true` to watch exactly what it hears.
 
+  **Barge-in.** Speaking while it talks cancels the reply mid-stream (measured 85ms
+  from the decision to the stream closing) and your words become the next turn. An
+  interrupted turn never runs its tools and never writes to history — a cancelled
+  "add a todo" adds nothing.
+
+  It also has to not interrupt *itself*: a laptop speaker feeds its own voice back
+  into the mic. So the mouth remembers what it just said and the ears discard
+  anything that resembles it, by word overlap and by character similarity, because
+  the round trip mangles words ("Obito" returns as "A bito"). While it is actually
+  speaking the bar for believing an interruption is raised further.
+
+  Slices are longer asleep than awake: asleep a slice must hold the whole wake word,
+  awake it must be short enough that an interruption registers. Consecutive slices
+  share `chunk_overlap_seconds` of audio so a word spoken across the join survives,
+  and the repeated words are stitched back out.
+
   Listening is gapless: the next capture starts *before* the last is transcribed, because
   whisper thinks for about a second and that is precisely when the start of your sentence
   used to go missing. Near-silence makes whisper invent — `[MUSIC]`, `(upbeat music)`,

@@ -5,11 +5,15 @@ spoken here is ever uploaded anywhere. Swapping in a different transcriber means
 rewriting `transcribe` and nothing else.
 """
 
+import atexit
 import difflib
 import re
 import subprocess
-import time
 import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 
 from config import CONFIG, ROOT
@@ -42,27 +46,139 @@ def start_recording(path):
 
 
 def stop_recording(process):
-    """Ask ffmpeg to quit cleanly so it writes a valid WAV header."""
-    try:
-        process.stdin.write(b"q")
-        process.stdin.flush()
-        process.wait(timeout=5)
-    except (BrokenPipeError, subprocess.TimeoutExpired, OSError):
-        process.terminate()
-        process.wait(timeout=5)
+    """Ask ffmpeg to quit cleanly, then insist. Never raises.
 
-
-def transcribe(wav, prompt=None):
-    """Return what was said, or "" if it was silence or noise.
-
-    `prompt` primes the decoder. Whisper has never seen the word "Zetsu", so
-    left alone it reaches for real words that sound similar. Telling it the name
-    up front makes it far likelier to spell it the same way twice.
+    'q' lets it write a valid WAV header, which is what we want. But a recorder
+    can wedge — the audio device is busy, or another one is mid-handover — and
+    this used to escalate to terminate() with an *unguarded* wait, so one stuck
+    ffmpeg killed the whole conversation. Escalate all the way to kill, and let
+    the caller deal with a short or missing file instead of a traceback.
     """
+    for step in ("quit", "terminate", "kill"):
+        try:
+            if step == "quit":
+                process.stdin.write(b"q")
+                process.stdin.flush()
+            elif step == "terminate":
+                process.terminate()
+            else:
+                process.kill()
+            process.wait(timeout=2)
+            return
+        except (BrokenPipeError, subprocess.TimeoutExpired, OSError, ValueError):
+            continue
+
+
+# --- the model, kept warm -----------------------------------------------------
+# whisper-cli reloads a 141MB model on every run. Measured: 1.26s for 0.65s of
+# audio, but only 1.39s for 3.26s — so ~1.2s of that is startup, every single
+# chunk. whisper-server loads the model once and answers in ~0.15s. Same model,
+# same output, 8x less waiting.
+
+_server = None
+
+
+def _model_path():
     model = ROOT / CONFIG["voice"]["whisper_model"]
     if not model.exists():
         raise FileNotFoundError(f"Whisper model missing: {model}")
-    command = ["whisper-cli", "-m", str(model), "-f", str(wav), "-nt", "-np"]
+    return model
+
+
+def server_url():
+    return f"http://127.0.0.1:{CONFIG['voice']['server_port']}/inference"
+
+
+def server_ready(timeout=1):
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{CONFIG['voice']['server_port']}/", timeout=timeout
+        )
+        return True
+    except urllib.error.HTTPError:
+        return True  # answered at all, which is all we need to know
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def start_server(wait_seconds=90):
+    """Load the model once, up front. The slow part happens here, deliberately.
+
+    Returns True if a server is answering — one we started, or one already
+    running from a previous session.
+    """
+    global _server
+    if server_ready():
+        return True
+
+    _server = subprocess.Popen(
+        [
+            "whisper-server", "-m", str(_model_path()),
+            "--host", "127.0.0.1",
+            "--port", str(CONFIG["voice"]["server_port"]),
+            "-nt", "-l", "en",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(stop_server)
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if server_ready():
+            return True
+        if _server.poll() is not None:
+            return False  # it died on the way up
+        time.sleep(0.5)
+    return False
+
+
+def stop_server():
+    global _server
+    if _server and _server.poll() is None:
+        _server.terminate()
+        try:
+            _server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _server.kill()
+    _server = None
+
+
+def _multipart(fields, filename, payload):
+    """Build a multipart body. ponytail: stdlib only, no requests dependency."""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+            f"\r\n\r\n{value}\r\n".encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{filename}"\r\nContent-Type: audio/wav\r\n\r\n'.encode()
+    )
+    parts.append(payload)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _transcribe_via_server(wav, prompt):
+    body, content_type = _multipart(
+        {"response_format": "text", **({"prompt": prompt} if prompt else {})},
+        Path(wav).name,
+        Path(wav).read_bytes(),
+    )
+    request = urllib.request.Request(
+        server_url(), data=body, headers={"Content-Type": content_type}
+    )
+    with urllib.request.urlopen(
+        request, timeout=CONFIG["voice"]["transcribe_timeout"]
+    ) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def _transcribe_via_cli(wav, prompt):
+    command = ["whisper-cli", "-m", str(_model_path()), "-f", str(wav), "-nt", "-np"]
     if prompt:
         command += ["--prompt", prompt]
     result = subprocess.run(
@@ -73,7 +189,26 @@ def transcribe(wav, prompt=None):
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip()[:200] or "whisper failed")
-    text = " ".join(ANNOTATION.sub(" ", result.stdout).split())
+    return result.stdout
+
+
+def transcribe(wav, prompt=None):
+    """Return what was said, or "" if it was silence or noise.
+
+    `prompt` primes the decoder. Whisper has never seen the word "Zetsu", so
+    left alone it reaches for real words that sound similar. Telling it the name
+    up front makes it far likelier to spell it the same way twice.
+    """
+    raw = None
+    if CONFIG["voice"]["use_server"] and server_ready():
+        try:
+            raw = _transcribe_via_server(wav, prompt)
+        except (urllib.error.URLError, OSError, TimeoutError):
+            raw = None  # fall through to the CLI rather than lose the turn
+    if raw is None:
+        raw = _transcribe_via_cli(wav, prompt)
+
+    text = " ".join(ANNOTATION.sub(" ", raw).split())
     return "" if normalise(text) in NOISE else text
 
 
@@ -108,14 +243,30 @@ class OpenMic:
     one is transcribed: there is always a recorder running.
     """
 
-    def __init__(self, seconds, prompt=None):
+    def __init__(self, seconds, prompt=None, overlap=None):
         self.seconds = seconds
         self.prompt = prompt
+        self.overlap = CONFIG["wake"]["chunk_overlap_seconds"] if overlap is None else overlap
         self.current = Recording()
 
-    def next_chunk(self):
-        time.sleep(self.seconds)
-        following = Recording()  # rolling before we stop to think
+    def next_chunk(self, seconds=None):
+        """One slice. `seconds` overrides the default for this slice only.
+
+        Asleep, a slice must be long enough to hold the whole wake word.
+        Awake, it must be short enough that an interruption registers quickly.
+        Same rolling recorder either way — only the length changes.
+        """
+        window = self.seconds if seconds is None else seconds
+        overlap = min(self.overlap, window * 0.5)
+
+        # Start the next recorder BEFORE this window closes, so consecutive
+        # slices share `overlap` seconds of audio. Without it a wake word can
+        # land across the join and be chopped in half — "Friday" arrives as
+        # "Day" and nothing wakes. With it, a split word is still whole in one
+        # of the two slices.
+        time.sleep(max(0.05, window - overlap))
+        following = Recording()
+        time.sleep(overlap)
         try:
             return self.current.finish(self.prompt)
         finally:
@@ -182,3 +333,52 @@ def matches_any(text, phrases):
     """
     cleaned = normalise(text)
     return any(phrase in cleaned for phrase in phrases)
+
+
+def stitch(parts):
+    """Join overlapping slices without repeating the words they share.
+
+    Consecutive slices deliberately share audio, so the same words are
+    transcribed twice. Left alone the question arrives as "what is on my todo
+    list model list". Trim the longest run of words that ends one slice and
+    starts the next.
+    """
+    merged = []
+    for part in parts:
+        words = part.split()
+        if not words:
+            continue
+        if not merged:
+            merged = words
+            continue
+        longest = min(len(merged), len(words), 8)
+        for size in range(longest, 0, -1):
+            tail = [w.lower().strip(".,?!") for w in merged[-size:]]
+            head = [w.lower().strip(".,?!") for w in words[:size]]
+            if tail == head:
+                words = words[size:]
+                break
+        merged += words
+    return " ".join(merged)
+
+
+def best_near_miss(text, cfg=CONFIG):
+    """The closest thing to the wake word in `text`, and how close it got.
+
+    Returns (phrase, ratio) or None. Used to learn what your wake word is
+    actually being heard as: anything that lands just under the threshold is a
+    variant worth adding, and you should not have to guess which.
+    """
+    words = normalise(text).split()
+    variants = cfg["wake"]["variants"]
+    best = (None, 0.0)
+    for size in (1, 2, 3):
+        for start in range(len(words) - size + 1):
+            window = " ".join(words[start : start + size])
+            if len(window) < 4:
+                continue
+            for variant in variants:
+                ratio = difflib.SequenceMatcher(None, window, variant).ratio()
+                if ratio > best[1]:
+                    best = (window, ratio)
+    return best if best[0] else None

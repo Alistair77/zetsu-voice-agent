@@ -14,6 +14,7 @@ Self-check:  ./.venv/bin/python zetsu.py --selftest
 
 import signal
 import sys
+import threading
 import time
 
 import brain
@@ -27,13 +28,17 @@ from config import CONFIG, NAME
 # One entry point for a turn, whatever the input was. Voice (Tier 3) and the
 # heartbeat (Tier 5) call this too — the brain is never written twice.
 
-def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_route=None):
+def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_route=None,
+         backend_override=None, cancelled=None):
     """Run one turn, letting the model chain tools until it's ready to answer.
 
     History is replaced only once the turn completes, so a failed turn leaves no
     dangling user message behind.
     """
-    backend, why = brain.route(text, cfg)
+    if backend_override:
+        backend, why = backend_override, "voice realtime preference"
+    else:
+        backend, why = brain.route(text, cfg)
     text = text.removeprefix(cfg["router"]["force_prefix"]).strip() or text
     rails.log("ROUTE", f"{backend} ({why})")
     if on_route:
@@ -64,6 +69,11 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
 
     for _ in range(cfg["tools"]["max_steps"]):
         message = respond(pending, tools.specs(), watched, cfg, backend)
+        # A streamed model can finish a token or tool-call event just as the
+        # user begins speaking. Never let that stale turn run a tool after an
+        # interruption; its local `pending` history is simply discarded.
+        if cancelled and cancelled():
+            raise brain.ResponseInterrupted()
         said.clear()
         pending = pending + [message]
 
@@ -74,6 +84,8 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
             return message["content"]
 
         for call in calls:
+            if cancelled and cancelled():
+                raise brain.ResponseInterrupted()
             name = call["function"]["name"]
             arguments = call["function"].get("arguments") or {}
             live.set_phase("working", name, backend)
@@ -162,6 +174,7 @@ def main():
         except Exception as exc:  # backend down, timeout, bad model — never crash out
             print(f"\n[couldn't reach the brain: {exc}]\n")
 
+    _release()
     print(f"{NAME} out.")
 
 
@@ -252,6 +265,7 @@ def voice_main():
                 on_delta=on_delta,
                 on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
                 confirm=confirm_aloud,
+                backend_override=CONFIG["voice"].get("backend"),
             )
             live.set_phase("speaking")
             speaker.flush()
@@ -263,6 +277,7 @@ def voice_main():
             print(f"\n[couldn't reach the brain: {exc}]\n")
 
     speaker.stop()
+    _release()
     print(f"{NAME} out.")
 
 
@@ -400,9 +415,44 @@ def wake_main():
             mic.close()
             mic = None
 
+    def pending_notices():
+        """Say anything the heartbeat has been holding, while the mic is live.
+
+        It could only ever print these before. If you are in the room and it is
+        listening, it should be able to tell you.
+        """
+        if speaker.is_busy() or rails.is_paused():
+            return False
+        import heartbeat
+
+        delivered = heartbeat.deliver_pending(speaker.say_now)
+        if delivered:
+            speaker.wait()
+        return bool(delivered)
+
     def listen_for(_seconds=None):
-        mic_on()
-        chunk = mic.next_chunk()
+        """One slice of audio, as text. A bad slice is skipped, never fatal.
+
+        Losing a chunk costs you a second; letting the exception out ends the
+        conversation. The recorder is rebuilt on the next call.
+        """
+        nonlocal mic
+        try:
+            mic_on()
+            chunk = mic.next_chunk(_seconds)
+        except Exception as exc:
+            rails.log("MIC", f"chunk dropped: {type(exc).__name__}: {exc}")
+            print("    ‹mic hiccup — skipping a slice›")
+            # Close before discarding. Dropping the reference alone leaves an
+            # ffmpeg holding the device, so every retry fails too and one
+            # transient hiccup becomes a dead microphone for the whole session.
+            try:
+                if mic is not None:
+                    mic.close()
+            except Exception:
+                pass
+            mic = None
+            return ""
         if settings.get("show_chunks") and chunk:
             print(f"    ‹heard› {chunk!r}")
         return chunk
@@ -417,50 +467,178 @@ def wake_main():
         parts = [opening] if opening else []
         mic_on()
         while True:
-            chunk = mic.next_chunk()
-            if settings.get("show_chunks") and chunk:
-                print(f"    ‹heard› {chunk!r}")
+            chunk = listen_for(settings["awake_chunk_seconds"])
             if chunk:
                 parts.append(chunk)
                 continue
             if parts:
-                return " ".join(parts).strip()
+                return ears.stitch(parts).strip()
             if time.time() > deadline:
                 return ""
             if rails.is_paused():
                 return ""
 
+    # The gate runs on the MAIN thread, never the worker.
+    #
+    # It used to call input() from inside the turn's thread. With the mic live,
+    # answering "yes" out loud was heard as a barge-in: it cancelled the turn,
+    # the tool never ran, and the thread stayed blocked on input() forever,
+    # swallowing the next line typed. So the worker only *asks*; the main loop,
+    # which already owns the microphone, does the listening and answers back.
+    gate = {"summary": None, "allowed": False}
+    gate_asked = threading.Event()
+    gate_answered = threading.Event()
+
     def confirm_aloud(summary):
-        speaker.stop()
-        speaker.say_now(f"I want to {summary.split('(')[0].replace('_', ' ')}. Is that okay?")
+        """Called on the worker thread. Hands the question to the main loop."""
+        gate["summary"] = summary
+        gate_answered.clear()
+        gate_asked.set()
+        if not gate_answered.wait(timeout=settings["confirm_timeout"] + 15):
+            return False  # nobody answered; never assume permission
+        return gate["allowed"]
+
+    def settle_gate():
+        """Main thread: ask out loud, listen for yes or no, default to no."""
+        summary = gate["summary"]
+        spoken_name = summary.split("(")[0].replace("_", " ")
         print(f"\n  ⚠︎  {NAME} wants to: {summary}")
-        try:
-            answer = input("      allow? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-        print()
-        return answer in ("y", "yes")
+        speaker.stop()
+        speaker.say_now(f"I want to {spoken_name}. Say yes or no.")
+        speaker.wait()
+
+        deadline = time.time() + settings["confirm_timeout"]
+        allowed = False
+        while time.time() < deadline:
+            reply = listen_for(settings["awake_chunk_seconds"])
+            if not reply or speaker.sounds_like_me(reply):
+                continue
+            if ears.matches_any(reply, settings["yes_words"]):
+                allowed = True
+                break
+            if ears.matches_any(reply, settings["no_words"]):
+                break
+            speaker.say_now("Yes or no?")
+            speaker.wait()
+
+        print(f"      {'allowed' if allowed else 'denied'} by voice\n")
+        if not allowed:
+            speaker.say_now("Alright, I won't.")
+        gate["allowed"] = allowed
+        gate_answered.set()
 
     def answer(said):
-        mic_off()  # nothing is recorded while it talks
+        """Answer one turn, while retaining the microphone for barge-in.
+
+        This is deliberately different from the old half-duplex loop. The
+        recorder that was already rolling when the user stopped talking remains
+        alive through generation and playback. A new utterance cancels both the
+        TTS process and Ollama's stream, then becomes the next turn.
+
+        A laptop speaker feeds its own speech back into a microphone, so this is
+        intended for headphones until an acoustic echo canceller is added.
+        """
         print(f"you › {said}")
         print(f"{NAME} › ", end="", flush=True)
-        try:
-            turn(
-                brain.respond, history, said,
-                on_delta=lambda piece: (print(piece, end="", flush=True), speaker.feed(piece))[0],
-                on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
-                confirm=confirm_aloud,
-                on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
+        interrupted = threading.Event()
+        outcome = {"error": None}
+
+        def on_delta(piece):
+            # A response can have one last network chunk in flight after an
+            # interruption. Do not allow it back into the speech queue.
+            if interrupted.is_set():
+                return
+            print(piece, end="", flush=True)
+            speaker.feed(piece)
+
+        def streaming_response(messages, specs, on_delta, cfg=None, backend=None):
+            return brain.respond(
+                messages, specs, on_delta, cfg, backend,
+                cancelled=interrupted.is_set,
             )
-            speaker.flush()
+
+        def run_turn():
+            try:
+                turn(
+                    streaming_response, history, said,
+                    on_delta=on_delta,
+                    on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
+                    confirm=confirm_aloud,
+                    on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
+                    backend_override=CONFIG["voice"].get("backend"),
+                    cancelled=interrupted.is_set,
+                )
+            except brain.ResponseInterrupted:
+                pass
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                if not interrupted.is_set():
+                    speaker.flush()
+
+        worker = threading.Thread(target=run_turn, daemon=True)
+        worker.start()
+
+        if not settings.get("barge_in", False):
+            # Retain the old safe half-duplex behavior for anyone using laptop
+            # speakers, where speech recognition would otherwise hear `say`.
+            mic_off()
+            while worker.is_alive():
+                if gate_asked.is_set():
+                    gate_asked.clear()
+                    mic_on()
+                    settle_gate()
+                    mic_off()
+                worker.join(timeout=0.2)
             speaker.wait()
-            print("\n")
-        except Exception as exc:
+            mic_on()
+        else:
+            minimum_words = settings.get("barge_in_min_words", 1)
+            # Stay live through both generation *and* queued playback. The
+            # latter is where most "I said stop but it kept talking" failures
+            # come from.
+            while worker.is_alive() or speaker.is_busy():
+                if gate_asked.is_set():
+                    gate_asked.clear()
+                    settle_gate()
+                    continue
+                chunk = listen_for(settings["awake_chunk_seconds"])
+                # While it is actually talking, demand more words before
+                # believing an interruption. Its own speech comes back as short
+                # mangled fragments ("4 10 a.m." from "before 10am") that no
+                # echo test catches reliably.
+                needed = minimum_words if not speaker.is_busy() else max(
+                    minimum_words, settings["barge_in_while_speaking_words"]
+                )
+                if len(chunk.split()) < needed:
+                    continue
+                if speaker.sounds_like_me(chunk):
+                    # Its own voice coming back through the speakers. Without
+                    # this it interrupts itself mid-sentence.
+                    continue
+                interrupted.set()
+                speaker.stop()
+                worker.join(timeout=2)
+                print("\n  ↳ interrupted")
+                # `OpenMic` has already started the following recording before
+                # transcribing this chunk, so collecting the rest introduces no
+                # new recording gap.
+                return hear_a_sentence(time.time() + settings["follow_up_seconds"], chunk)
+            worker.join()
+
+        if outcome["error"]:
             speaker.stop()
-            print(f"\n[couldn't reach the brain: {exc}]\n")
-        mic_on()
+            print(f"\n[couldn't reach the brain: {outcome['error']}]\n")
+            return ""
+        print("\n")
+        return ""
+
+    if CONFIG["voice"]["use_server"]:
+        print("Loading the speech model (once — everything after this is fast)…")
+        if ears.start_server():
+            print("  ready.\n")
+        else:
+            print("  couldn't start it; falling back to per-chunk loading.\n")
 
     print(f'Open mic. Say "{phrase}" to wake me.')
     print(f'Once awake I keep listening for {settings["follow_up_seconds"]}s after each reply.')
@@ -468,7 +646,7 @@ def wake_main():
     live.claim_mic()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
-    carry, awake, staying = "", False, False
+    carry, awake, staying, pending = "", False, False, ""
     try:
         while True:
             if rails.is_paused():
@@ -487,6 +665,14 @@ def wake_main():
                 spoken = ears.find_wake(f"{carry} {chunk}")
                 carry = " ".join(chunk.split()[-3:])
                 if spoken is None:
+                    # Remember what *nearly* woke it. These are the spellings
+                    # your voice actually produces, and `--misses` turns them
+                    # into variants you can add without guessing.
+                    near = ears.best_near_miss(chunk)
+                    if near and settings["similarity"] - 0.22 <= near[1] < settings["similarity"]:
+                        rails.log("WAKE-MISS", f"{near[0]!r} ({near[1]:.2f})")
+                    if pending_notices():
+                        continue
                     continue
                 carry, awake = "", True
                 print(f'  ◉ awake ("{phrase}")')
@@ -496,8 +682,16 @@ def wake_main():
                     speaker.wait()
                     mic_on()
                     spoken = ""
+                else:
+                    # Finish hearing the sentence before answering it. Taking the
+                    # wake slice as the whole question truncates it ("what is on
+                    # my") and the rest of what you were saying then arrives as
+                    # an interruption of the answer you did not want yet.
+                    spoken = hear_a_sentence(
+                        time.time() + settings["awake_chunk_seconds"] * 2, spoken
+                    )
             else:
-                spoken = ""
+                spoken, pending = pending, ""
 
             if not spoken:
                 until = float("inf") if staying else time.time() + settings["follow_up_seconds"]
@@ -526,7 +720,7 @@ def wake_main():
                 print("  ∞ staying awake until you say bye\n")
                 rails.log("MIC", "staying awake for a long conversation")
 
-            answer(spoken)
+            pending = answer(spoken)
     except KeyboardInterrupt:
         print()
     finally:
@@ -534,7 +728,37 @@ def wake_main():
         live.release_mic()
     speaker.stop()
     live.set_phase("idle")
+    _release()
     print(f"{NAME} out.")
+
+
+def misses_main():
+    """Show what nearly woke it, most frequent first."""
+    import collections
+    import re as _re
+
+    if not rails.LOG.exists():
+        sys.exit("Nothing logged yet — run --wake and talk to it first.")
+    found = _re.findall(r"WAKE-MISS\s+'([^']+)' \(([0-9.]+)\)", rails.LOG.read_text())
+    if not found:
+        print("No near misses logged. Either it is waking cleanly, or you have")
+        print("not run --wake since this was added.")
+        return
+    counts = collections.Counter(phrase for phrase, _ in found)
+    best = {phrase: max(float(r) for p, r in found if p == phrase) for phrase in counts}
+    print(f'Things that nearly woke "{CONFIG["wake"]["phrase"]}":\n')
+    for phrase, times in counts.most_common(12):
+        print(f"  {times:>3}x  {phrase!r}   closest {best[phrase]:.2f}")
+    print("\nAdd the ones that were really you, to [wake] variants in config.toml.")
+
+
+def _release():
+    """Give the RAM back on the way out — model first, then the speech server."""
+    import ears
+
+    if brain.unload():
+        print("  released the language model (~2GB back)")
+    ears.stop_server()
 
 
 def _short(arguments, limit=60):
@@ -616,6 +840,32 @@ def selftest():
     denied = tools.run("add_todo", {"text": "should not exist"}, deny)
     assert "BLOCKED" in denied and "NOT run" in denied, denied
     assert "should not exist" not in tools.list_todos("all")
+
+    # 4b. A barge-in discards a stale tool call before it can be executed.
+    try:
+        turn(
+            scripted(calling("add_todo", {"text": "stale interrupted call"})),
+            [], "add this", nothing, nothing, allow,
+            cancelled=lambda: True,
+        )
+    except brain.ResponseInterrupted:
+        pass
+    else:
+        raise AssertionError("interrupted turn did not stop")
+    assert "stale interrupted call" not in tools.list_todos("all")
+
+    # 4c. the mouth's own words are recognised coming back through the mic,
+    #     so an open mic cannot interrupt the assistant mid-sentence
+    import mouth as _mouth
+
+    echoing = _mouth.Speaker.__new__(_mouth.Speaker)
+    echoing.echo, echoing.echo_seconds, echoing.echo_threshold = [], 20, 0.45
+    echoing.remember_saying("Your open todos are buy oat milk and renew passport")
+    assert echoing.sounds_like_me("You're open todos are buy oat milk")
+    # mangled by the round trip through the air, and still recognised
+    assert echoing.sounds_like_me("Your open todo are by oat milk")
+    assert not echoing.sounds_like_me("stop that and tell me the time")
+    assert not echoing.sounds_like_me("yes")  # too short to judge on overlap
 
     # 5. a broken tool returns an explanation, it does not raise
     assert "no tool called" in tools.run("nope", {}, allow)
@@ -726,6 +976,8 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
+    elif "--misses" in sys.argv:
+        misses_main()
     elif "--calibrate" in sys.argv:
         calibrate_main()
     elif "--wake" in sys.argv:

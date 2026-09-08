@@ -20,7 +20,11 @@ name = "qwen2.5:3b"
 host = "http://localhost:11434"
 timeout_seconds = 120
 cli_model = "sonnet"    # only used when backend = "claude-cli"
-keep_alive = "30m"   # how long Ollama holds the model in RAM between turns
+keep_alive = "30m"      # how long Ollama holds the model in RAM between turns
+# Hand that RAM back the moment Zetsu exits, instead of waiting out keep_alive.
+# The model is ~2.2GB on an 8GB machine — warm while you are talking to it is
+# the point, warm while you are not is a tax on everything else you have open.
+release_on_exit = true
 
 [router]
 # Only used when backend = "auto". Fast and free by default; pay for the CLI
@@ -49,11 +53,33 @@ max_steps = 5
 # Ears: whisper.cpp, on-device. Nothing spoken here leaves this Mac.
 whisper_model = "models/ggml-base.en.bin"
 transcribe_timeout = 60
+
+# Keep the Whisper model loaded in a local server instead of reloading 141MB on
+# every chunk. Measured: 1.26s per chunk via the CLI, 0.15s via the server.
+# Started automatically on first use; the CLI stays as a fallback.
+use_server = true
+server_port = 8770
 mic = ":0"           # ffmpeg avfoundation audio device — see `ffmpeg -f avfoundation -list_devices true -i ""`
 max_seconds = 60     # hard cap on one recording
 
+# Voice needs a predictable, streamable local model. The automatic router can
+# choose the slower CLI for a word such as "explain", which makes spoken turns
+# feel stalled and cannot be cancelled mid-call.
+backend = "ollama"
+
+# `say` is not native streaming TTS. Start a long first sentence at a word
+# boundary rather than waiting indefinitely for its full stop.
+speak_chunk_chars = 120
+
 # Mouth: macOS `say`, built in. More voices: System Settings > Accessibility >
 # Spoken Content > System Voice > Manage Voices.
+# How long the mouth remembers what it said, so the ears can discard their own
+# echo instead of treating it as you interrupting.
+echo_memory_seconds = 20
+# How much a heard slice has to resemble what was just said to count as the
+# assistant's own echo. Lower catches more echo; too low and it ignores you.
+echo_threshold = 0.45
+
 say_voice = "Samantha"
 say_rate = 190
 
@@ -95,9 +121,36 @@ variants = ["friday", "fry day", "freeday", "free day", "fridays", "friday s"]
 # also on things you did not say. Raise it if it starts triggering on its own.
 similarity = 0.78
 takes = 3                # how many samples `--calibrate` records
-chunk_seconds = 2.5      # how long each listening slice is
+# Asleep: long enough to hold the whole wake word in one slice. Latency does
+# not matter here, reliability does — a chopped "Friday" is heard as "Day".
+chunk_seconds = 2.5
+# Awake: short slices so an interruption registers fast. Reliability matters
+# less now, because you are mid-conversation and it collects across slices.
+awake_chunk_seconds = 1.2
+# Consecutive slices share this much audio, so a word spoken across the join is
+# still complete in one of them. Costs a little CPU, buys reliable waking.
+chunk_overlap_seconds = 0.7
 show_chunks = true      # print every slice it hears — for debugging the mic
 command_seconds = 6      # how long you get to speak after it wakes
+
+# Full duplex is possible only when the microphone does not hear the assistant's
+# own speaker output. Use headphones; laptop speakers will produce false
+# interruptions without a real acoustic echo canceller.
+barge_in = true
+# Two words, not one. Whisper invents single words out of near-silence, and a
+# stray one should never cancel a reply.
+barge_in_min_words = 2
+
+# Confirmations are answered out loud. Say yes or no. Anything else, or silence
+# past the timeout, counts as NO — a gate that waits forever for someone who
+# isn't there is a gate that quietly stops working.
+# Words needed to interrupt *while it is still speaking*. Higher than the normal
+# bar, because its own voice returns as short mangled fragments.
+barge_in_while_speaking_words = 4
+
+confirm_timeout = 15
+yes_words = ["yes", "yeah", "yep", "yup", "sure", "go ahead", "do it", "okay", "ok", "please do"]
+no_words = ["no", "nope", "dont", "do not", "cancel", "stop", "never mind", "nevermind", "skip"]
 
 # After it replies it keeps listening this long, so you can just answer a
 # follow-up question instead of saying the wake word again. Silence past this
