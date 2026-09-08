@@ -12,6 +12,7 @@ Voice:       ./.venv/bin/python zetsu.py --voice
 Self-check:  ./.venv/bin/python zetsu.py --selftest
 """
 
+import select
 import signal
 import sys
 import threading
@@ -102,6 +103,44 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
     return "I went round in circles on that one — ask me again more specifically?"
 
 
+def announce_finished(history):
+    """Print anything that finished in the background. True if it printed.
+
+    In a terminal the raw result is more use than a phrased one — you can read a
+    long answer, scroll it, copy it. Voice phrases these instead, because you
+    cannot skim speech.
+    """
+    done = jobs.collect()
+    for job in done:
+        print(f"\n  ✓ {job['label']} — finished in {job['took']:.0f}s")
+        print(f"    {job['result']}\n")
+        # Put it in the conversation, so a follow-up question knows what it means.
+        history.append({"role": "user", "content": f"[{job['label']} finished]"})
+        history.append({"role": "assistant", "content": str(job["result"])})
+    return bool(done)
+
+
+def read_or_report(prompt, history):
+    """Wait for a typed line, reporting finished work while we wait.
+
+    A plain input() blocks until you press return, so a job that finished five
+    seconds ago sits invisible until you happen to type something. Polling stdin
+    lets the answer arrive when it arrives.
+    """
+    print(prompt, end="", flush=True)
+    while True:
+        if not sys.stdin.isatty():
+            return sys.stdin.readline()            # piped input: no polling needed
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+        except (OSError, ValueError):
+            return sys.stdin.readline()
+        if ready:
+            return sys.stdin.readline()
+        if announce_finished(history):
+            print(prompt, end="", flush=True)      # redraw the prompt underneath
+
+
 def handle_command(text):
     """Console controls. Returns True if `text` was one and has been dealt with."""
     if text in ("/pause", "/stop"):
@@ -150,7 +189,10 @@ def main():
 
     while True:
         try:
-            text = input("you › ").strip()
+            line = read_or_report("you › ", history)
+            if line == "":            # EOF
+                raise EOFError
+            text = line.strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -183,6 +225,7 @@ def main():
             )
             live.set_phase("idle")
             print("\n")
+            announce_finished(history)
         except Exception as exc:  # backend down, timeout, bad model — never crash out
             print(f"\n[couldn't reach the brain: {exc}]\n")
 
@@ -891,7 +934,7 @@ def selftest():
 
     # 4. a confirmed tool is blocked when the answer is no, and runs when it's yes
     denied = tools.run("add_todo", {"text": "should not exist"}, deny)
-    assert "BLOCKED" in denied and "NOT run" in denied, denied
+    assert "said NO" in denied and "NOT run" in denied, denied
     assert "should not exist" not in tools.list_todos("all")
 
     # 4b. A barge-in discards a stale tool call before it can be executed.
@@ -922,9 +965,9 @@ def selftest():
 
     # 5. a broken tool returns an explanation, it does not raise
     # Outcomes are stamped by the tool, never inferred by the model
-    assert tools.run("nope", {}, allow).startswith("[FAILED]")
-    assert tools.run("list_todos", {"bogus": 1}, allow).startswith("[FAILED]")
-    assert tools.run("list_todos", {}, allow).startswith("[OK]")
+    assert "did not work" in tools.run("nope", {}, allow)
+    assert "did not work" in tools.run("list_todos", {"bogus": 1}, allow)
+    assert "oat milk" in tools.run("list_todos", {}, allow)   # success: just the answer
 
     # 6. the mouth speaks whole sentences as they complete, never half of one
     import mouth

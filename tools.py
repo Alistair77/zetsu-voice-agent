@@ -517,7 +517,7 @@ def run(name, arguments, confirmer):
     summary = f"{name}(" + ", ".join(f"{k}={v!r}" for k, v in arguments.items()) + ")"
     if not entry:
         rails.log("UNKNOWN", summary)
-        return f"[FAILED] There is no tool called {name!r}. Nothing happened."
+        return f"That did not work: there is no tool called {name!r}. Nothing changed."
 
     if rails.needs_confirm(name, entry["confirm"]):
         if not confirmer(summary):
@@ -525,7 +525,7 @@ def run(name, arguments, confirmer):
             # Say it loudly. A small model will otherwise breeze past a soft refusal
             # and cheerfully report success for something that never happened.
             return (
-                f"[BLOCKED] The user said NO to {name}. It did NOT run and NOTHING "
+                f"The user said NO to {name}. It did NOT run and NOTHING "
                 "changed. You must tell the user plainly that you did not do it. "
                 "Do not claim it succeeded. Do not try it again unless they ask."
             )
@@ -536,24 +536,27 @@ def run(name, arguments, confirmer):
     # Whether an action worked is decided here, by what actually happened — never
     # by the model reading a hopeful-sounding string. Every result is stamped, and
     # the system prompt forbids claiming success without an [OK].
+    # No decorated prefix on success. A small model copies whatever distinctive
+    # format it is shown — given "[OK]" it starts answering "[OK] 4" — so the
+    # only marked results are the ones that must not be mistaken for success.
     if entry["slow"] >= CONFIG["jobs"]["background_over_seconds"]:
         label = name.replace("_", " ")
         job_id, estimate = jobs.start(
             label, lambda: str(entry["function"](**arguments)), entry["slow"]
         )
-        return (f"[STARTED] {label} is running in the background, about "
+        return (f"{label} is now running in the background, about "
                 f"{estimate}s. Tell the user roughly how long and that you will "
                 f"come back with it. Do not invent the answer — you do not have it "
                 f"yet. Carry on talking to them about anything else.")
 
     try:
-        result = f"[OK] {entry['function'](**arguments)}"
+        result = str(entry['function'](**arguments))
     except TypeError as exc:
         rails.log("FAILED", f"{summary} -> bad arguments: {exc}")
-        return f"[FAILED] {name} was called wrongly: {exc}. Nothing happened."
+        return f"That did not work: {name} was called wrongly ({exc}). Nothing changed."
     except Exception as exc:
         rails.log("FAILED", f"{summary} -> {exc}")
-        return f"[FAILED] {name} did not work: {exc}. Nothing happened."
+        return f"That did not work: {exc}. Nothing changed."
 
     if entry["screen"]:
         result, caught = rails.screen(result, name)
