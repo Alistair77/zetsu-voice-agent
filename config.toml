@@ -57,6 +57,15 @@ transcribe_timeout = 60
 # Keep the Whisper model loaded in a local server instead of reloading 141MB on
 # every chunk. Measured: 1.26s per chunk via the CLI, 0.15s via the server.
 # Started automatically on first use; the CLI stays as a fallback.
+# Voice activity detection. Measured on this mic: an empty room is about -48
+# dBFS, speech about -33. The floor is learned from the room as you go, so a
+# fan or a cafe does not break it; the margin is how far above the floor
+# something has to be to count as you talking.
+vad_silence_dbfs = -48
+vad_margin_db = 8
+vad_tail_ms = 350        # how much of a slice's end must be quiet to call it over
+vad_skip_silent = true   # do not run whisper on a slice that is clearly silence
+
 use_server = true
 server_port = 8770
 mic = ":0"           # ffmpeg avfoundation audio device — see `ffmpeg -f avfoundation -list_devices true -i ""`
@@ -70,6 +79,10 @@ backend = "ollama"
 # `say` is not native streaming TTS. Start a long first sentence at a word
 # boundary rather than waiting indefinitely for its full stop.
 speak_chunk_chars = 120
+# The first fragment of a reply is released early, at a clause boundary, so
+# sound starts before the sentence is finished. Later fragments wait for a full
+# stop — by then there is no latency left to save and whole sentences sound better.
+speak_opening_chars = 22
 
 # Mouth. "piper" is a local neural voice — natural, still entirely offline, model
 # held in memory. "say" is the macOS built-in: instant, always available, robotic.

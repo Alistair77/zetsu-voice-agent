@@ -5,8 +5,10 @@ spoken here is ever uploaded anywhere. Swapping in a different transcriber means
 rewriting `transcribe` and nothing else.
 """
 
+import array
 import atexit
 import difflib
+import math
 import re
 import subprocess
 import tempfile
@@ -14,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import wave
 from pathlib import Path
 
 from config import CONFIG, ROOT
@@ -212,6 +215,32 @@ def transcribe(wav, prompt=None):
     return "" if normalise(text) in NOISE else text
 
 
+def level_dbfs(wav, last_ms=None):
+    """Loudness of a recording, or of just its last `last_ms`, in dBFS.
+
+    Measured on this machine: an empty room sits near -48, speech near -33. That
+    15dB gap is what makes silence detectable without a neural VAD.
+    """
+    try:
+        with wave.open(str(wav)) as handle:
+            rate, frames = handle.getframerate(), handle.getnframes()
+            if last_ms:
+                skip = max(0, frames - int(rate * last_ms / 1000))
+                handle.setpos(skip)
+                frames -= skip
+            data = handle.readframes(frames)
+    except (wave.Error, OSError, EOFError):
+        return -99.0
+    if not data:
+        return -99.0
+    samples = array.array("h")
+    samples.frombytes(data[: len(data) // 2 * 2])
+    if not samples:
+        return -99.0
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    return 20 * math.log10(rms / 32768) if rms > 0 else -99.0
+
+
 class Recording:
     """A recording in progress. Start it, let the user talk, then finish it."""
 
@@ -219,8 +248,10 @@ class Recording:
         self.workspace = tempfile.TemporaryDirectory()
         self.wav = Path(self.workspace.name) / "turn.wav"
         self.process = start_recording(self.wav)
+        self.level = -99.0
+        self.tail_level = -99.0
 
-    def finish(self, prompt=None):
+    def finish(self, prompt=None, quiet_below=None):
         """Stop recording and return what was said ("" if nothing was)."""
         try:
             stop_recording(self.process)
@@ -229,6 +260,12 @@ class Recording:
                     "No audio captured. Grant microphone access to this terminal "
                     "in System Settings > Privacy & Security > Microphone."
                 )
+            self.level = level_dbfs(self.wav)
+            self.tail_level = level_dbfs(self.wav, CONFIG["voice"]["vad_tail_ms"])
+            if quiet_below is not None and self.level < quiet_below:
+                # Nothing was said. Whisper on silence costs time and invents
+                # words; skipping it is faster *and* more accurate.
+                return ""
             return transcribe(self.wav, prompt)
         finally:
             self.workspace.cleanup()
@@ -248,6 +285,26 @@ class OpenMic:
         self.prompt = prompt
         self.overlap = CONFIG["wake"]["chunk_overlap_seconds"] if overlap is None else overlap
         self.current = Recording()
+        # Learned from the room rather than assumed. A fixed threshold is right
+        # until a fan comes on, and then it is wrong for the rest of the day.
+        self.noise_floor = CONFIG["voice"]["vad_silence_dbfs"] - CONFIG["voice"]["vad_margin_db"]
+        self.level = -99.0
+        self.tail_level = -99.0
+
+    def silence_threshold(self):
+        return self.noise_floor + CONFIG["voice"]["vad_margin_db"]
+
+    def tail_is_quiet(self):
+        """True if this slice ended in silence — i.e. the speaker has stopped."""
+        return self.tail_level < self.silence_threshold()
+
+    def _learn_floor(self, level):
+        if level <= -99.0:
+            return
+        if level < self.noise_floor:
+            self.noise_floor = self.noise_floor * 0.7 + level * 0.3   # drops fast
+        elif level < self.silence_threshold():
+            self.noise_floor = self.noise_floor * 0.98 + level * 0.02  # creeps up
 
     def next_chunk(self, seconds=None):
         """One slice. `seconds` overrides the default for this slice only.
@@ -268,7 +325,16 @@ class OpenMic:
         following = Recording()
         time.sleep(overlap)
         try:
-            return self.current.finish(self.prompt)
+            text = self.current.finish(
+                self.prompt,
+                quiet_below=self.silence_threshold()
+                if CONFIG["voice"]["vad_skip_silent"]
+                else None,
+            )
+            self.level = self.current.level
+            self.tail_level = self.current.tail_level
+            self._learn_floor(self.level)
+            return text
         finally:
             self.current = following
 

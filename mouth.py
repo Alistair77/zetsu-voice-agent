@@ -30,6 +30,11 @@ from config import CONFIG, ROOT
 # fallback from waiting for a paragraph.
 BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 
+# For the FIRST thing said in a reply only. A full stop can be a long way off,
+# and every millisecond before the first sound is one the listener experiences
+# as lag — so the opening fragment is released at a clause boundary instead.
+OPENING = re.compile(r"(?<=[,;:])\s+|(?<=[.!?])\s+|\n+")
+
 
 def _words(text):
     """Lowercase words, punctuation dropped — the air mangles everything else."""
@@ -49,6 +54,7 @@ class Speaker:
         self.queue = queue.Queue()
         self.buffer = ""
         self.chunk_chars = cfg["voice"].get("speak_chunk_chars", 120)
+        self.opening_chars = cfg["voice"].get("speak_opening_chars", 45)
         self.current = None
         # What it has said lately, so the ears can recognise their own echo.
         self.echo = []
@@ -179,14 +185,27 @@ class Speaker:
         """Take a chunk of streamed text; speak whatever sentences are complete."""
         self.buffer += delta
         while True:
-            parts = BOUNDARY.split(self.buffer, maxsplit=1)
-            if len(parts) >= 2:
+            # Nothing spoken yet? Get *something* out fast: split on clauses and
+            # accept a much shorter fragment. After that, whole sentences —
+            # they sound better and there is no longer any latency to save.
+            opening = self.first_audio is None and not self.queue.qsize()
+            pattern = OPENING if opening else BOUNDARY
+            minimum = self.opening_chars if opening else self.chunk_chars
+            parts = pattern.split(self.buffer, maxsplit=1)
+            # Synthesis time scales with length: ~113ms for 15 characters,
+            # ~553ms for 36. So the opening fragment is capped short even when a
+            # clause boundary sits further along — the rest catches up while the
+            # first words are already playing.
+            if (
+                len(parts) >= 2
+                and len(parts[0].strip()) >= (4 if opening else 1)
+                and not (opening and len(parts[0].strip()) > minimum)
+            ):
                 sentence, self.buffer = parts[0].strip(), parts[1]
-            elif len(self.buffer) >= getattr(self, "chunk_chars", 120):
+            elif len(self.buffer) >= minimum:
                 # Keep words intact. This is a latency escape hatch, not a
                 # replacement for punctuation-aware speech.
-                chunk_chars = getattr(self, "chunk_chars", 120)
-                cut = self.buffer.rfind(" ", 0, chunk_chars + 1)
+                cut = self.buffer.rfind(" ", 0, minimum + 1)
                 if cut <= 0:
                     return
                 sentence, self.buffer = self.buffer[:cut].strip(), self.buffer[cut + 1:]

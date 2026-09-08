@@ -471,6 +471,14 @@ def wake_main():
             if chunk:
                 parts.append(chunk)
                 marks["speech_end"] = time.time()
+                # If this slice already ended in silence, they have stopped —
+                # end the turn here. Waiting for a whole further silent slice
+                # was 1670ms of the old 2865ms turn, for no information.
+                if mic is not None and mic.tail_is_quiet():
+                    marks["endpoint"] = time.time()
+                    collected = ears.stitch(parts).strip()
+                    marks["stt"] = time.time()
+                    return collected
                 continue
             if parts:
                 marks["endpoint"] = time.time()
@@ -928,6 +936,9 @@ def selftest():
     spoken = []
     speaker = mouth.Speaker.__new__(mouth.Speaker)  # no audio thread, just the logic
     speaker.buffer = ""
+    speaker.first_audio = 1.0          # pretend it already spoke: sentence mode
+    speaker.opening_chars = 45
+    speaker.chunk_chars = 120
     speaker.queue = type("Q", (), {"put": lambda self, t: spoken.append(t)})()
     for piece in ["Sure. ", "I'll ch", "eck that", " now! Any", "thing else"]:
         mouth.Speaker.feed(speaker, piece)
