@@ -321,6 +321,9 @@ class StreamMic:
         # cancellation, and unlike a text comparison it is not fooled when
         # whisper hallucinates something unrecognisable out of the echo.
         self.duck_db = 0.0
+        # Set by the front end to the speaker, so the mic can recognise the
+        # assistant's own voice coming back rather than merely ducking under it.
+        self.reference = None
 
         self.process = subprocess.Popen(
             [
@@ -378,6 +381,56 @@ class StreamMic:
             except queue.Empty:
                 break
 
+    def is_echo(self, frame, heard_at):
+        """Is this frame the assistant's own voice arriving back?
+
+        Ducking the threshold while speaking was a blunt stand-in: it also
+        ignores you when you talk quietly, and lets a loud burst of echo through.
+        This compares what the microphone heard against what the speaker actually
+        played a moment earlier. Correlation is the honest test — if the waveform
+        matches something we emitted, it is ours, however garbled whisper would
+        find it.
+        """
+        if self.reference is None:
+            return False
+        try:
+            import numpy as np
+        except ImportError:
+            return False
+
+        stream = self.cfg["stream"]
+        latest = heard_at - stream["echo_min_delay_ms"] / 1000
+        earliest = heard_at - stream["echo_max_delay_ms"] / 1000 - self.frame_ms / 1000
+        window = self.reference(earliest, latest + self.frame_ms / 1000)
+        if window is None or len(window) < self.frame_bytes // 2:
+            return False
+
+        mic = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        mic = mic - mic.mean()
+        mic_energy = float(np.linalg.norm(mic))
+        if mic_energy < 1.0:
+            return False
+
+        window = window - window.mean()
+        if float(np.linalg.norm(window)) < 1.0:
+            return False   # we played silence, so this is not our echo
+
+        overlap = np.correlate(window, mic, "valid")
+        if not len(overlap):
+            return False
+
+        # Normalise at each lag against the reference energy *at that lag*, not
+        # against the loudest stretch anywhere in the window — otherwise a wider
+        # search silently lowers every score and looking harder finds less.
+        rolling = np.sqrt(np.convolve(window * window, np.ones(len(mic)), "valid"))
+        scale = rolling * mic_energy
+        usable = scale > 0
+        if not usable.any():
+            return False
+        scores = np.zeros_like(overlap)
+        scores[usable] = np.abs(overlap[usable]) / scale[usable]
+        return float(np.max(scores)) >= stream["echo_correlation"]
+
     def next_utterance(self, deadline=None, on_speech_start=None):
         """Wait for something to be said and return it as text.
 
@@ -387,6 +440,7 @@ class StreamMic:
         stream = self.cfg["stream"]
         preroll = collections.deque(maxlen=max(1, stream["preroll_ms"] // self.frame_ms))
         speech, in_speech, quiet_ms, spoken_ms = [], False, 0, 0
+        onset = 0   # consecutive loud frames that were not our own echo
 
         while True:
             if deadline is not None and not in_speech and time.time() > deadline:
@@ -400,12 +454,21 @@ class StreamMic:
 
             level = frame_dbfs(frame)
             loud = level > self.threshold()
+            if loud and self.is_echo(frame, time.time()):
+                loud = False        # our own voice, not yours
             if not loud:
                 self._learn_floor(level)
 
+            # Starting a turn on a single loud frame is fine in a quiet room and
+            # wrong while the assistant is talking, where the occasional frame of
+            # its own echo survives the correlation test. Demand persistence
+            # instead: scattered frames never accumulate, a sentence always does.
+            needed = stream["onset_frames_while_speaking"] if self.duck_db else 1
+            onset = onset + 1 if loud else 0
+
             if not in_speech:
                 preroll.append(frame)
-                if loud and not self.muted:
+                if loud and onset >= needed and not self.muted:
                     in_speech = True
                     speech = list(preroll)   # keep the onset rather than clip it
                     spoken_ms, quiet_ms = len(speech) * self.frame_ms, 0

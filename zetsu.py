@@ -468,6 +468,9 @@ def wake_main():
 
     speaker = mouth.Speaker()
     mic = ears.StreamMic(prompt=phrase)
+    # Echo cancellation: the microphone can ask the speaker what it just played,
+    # and recognise that audio coming back instead of guessing from loudness.
+    mic.reference = speaker.reference_between
     history, marks = [], {}
 
     def note_timing():
@@ -1069,6 +1072,34 @@ def selftest():
         CONFIG["notes"]["roots"] = real_roots
 
     assert rails.screen("perfectly ordinary text", "x")[1] is None
+
+    # 9b. echo cancellation: it knows its own voice from anyone else's
+    try:
+        import numpy as _np
+
+        import ears as _ears
+
+        _mic = _ears.StreamMic.__new__(_ears.StreamMic)
+        _mic.cfg, _mic.frame_ms, _mic.frame_bytes = CONFIG, 20, 640
+        _rng = _np.random.default_rng(7)
+        _played = _rng.standard_normal(16000).astype(_np.float32) * 4000
+
+        # the microphone hears a delayed, quieter, slightly noisy copy of it
+        _at = 8000
+        _heard = (_played[_at : _at + 320] * 0.4
+                  + _rng.standard_normal(320).astype(_np.float32) * 60)
+        _mic.reference = lambda start, end: _played
+        assert _mic.is_echo(_heard.astype(_np.int16).tobytes(), 0.0), "missed its own echo"
+
+        # somebody else talking is not its echo, however loud
+        _other = _rng.standard_normal(320).astype(_np.float32) * 4000
+        assert not _mic.is_echo(_other.astype(_np.int16).tobytes(), 0.0), "false echo alarm"
+
+        # and with nothing played, nothing can be echo
+        _mic.reference = lambda start, end: None
+        assert not _mic.is_echo(_other.astype(_np.int16).tobytes(), 0.0)
+    except ImportError:
+        pass   # numpy absent: echo cancellation degrades to ducking, tested above
 
     # 10. private material is out of bounds, enforced in code not by asking
     import privacy

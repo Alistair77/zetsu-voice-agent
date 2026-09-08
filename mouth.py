@@ -11,6 +11,7 @@ instant, always present, unmistakably a robot. If Piper is missing or fails to
 load, speech degrades to `say` rather than going silent.
 """
 
+import collections
 import difflib
 import itertools
 import queue
@@ -66,6 +67,11 @@ class Speaker:
         self.echo_seconds = cfg["voice"].get("echo_memory_seconds", 20)
         self.echo_threshold = cfg["voice"].get("echo_threshold", 0.45)
         self.first_audio = None   # when sound actually reached the speakers
+        # What was actually played, and when. This is the reference signal for
+        # echo cancellation: the microphone is about to hear this back, and
+        # knowing exactly what it will hear is what makes it removable.
+        self.played = collections.deque(maxlen=cfg["voice"].get("echo_reference_chunks", 12))
+        self.reference_rate = 16000
         self.engine = cfg["voice"].get("engine", "say")
         self.piper = self._load_piper() if self.engine == "piper" else None
         self.workspace = tempfile.TemporaryDirectory()
@@ -193,10 +199,53 @@ class Speaker:
         except Exception:
             return None
 
+    def _remember_signal(self, path, started):
+        """Keep the played samples at microphone rate, stamped with playback time."""
+        try:
+            import numpy as np
+
+            with wave.open(str(path)) as handle:
+                rate = handle.getframerate()
+                raw = handle.readframes(handle.getnframes())
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            if rate != self.reference_rate and len(samples):
+                # Straight linear resample to the mic's rate. Good enough to
+                # correlate against; this is not for listening to.
+                count = int(len(samples) * self.reference_rate / rate)
+                samples = np.interp(
+                    np.linspace(0, len(samples) - 1, count),
+                    np.arange(len(samples)), samples,
+                ).astype(np.float32)
+            self.played.append((started, samples))
+        except Exception:
+            pass   # no reference is survivable; a crash here is not
+
+    def reference_between(self, start, end):
+        """The audio this speaker played between two moments, at mic rate."""
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        span = int((end - start) * self.reference_rate)
+        if span <= 0:
+            return None
+        window = np.zeros(span, dtype=np.float32)
+        filled = False
+        for played_at, samples in list(self.played):
+            offset = int((played_at - start) * self.reference_rate)
+            begin, finish = max(0, offset), min(span, offset + len(samples))
+            if finish <= begin:
+                continue
+            piece = samples[begin - offset : finish - offset]
+            window[begin:finish] = piece
+            filled = True
+        return window if filled else None
+
     def _play(self, path, text):
         if path is None:
             self._speak_system(text)
             return
+        self._remember_signal(path, time.time())
         self.current = subprocess.Popen(
             ["afplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )

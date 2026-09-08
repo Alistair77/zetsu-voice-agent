@@ -121,6 +121,7 @@ piper_model = "models/piper/en_US-amy-medium.onnx"
 # Spoken Content > System Voice > Manage Voices.
 # How long the mouth remembers what it said, so the ears can discard their own
 # echo instead of treating it as you interrupting.
+echo_reference_chunks = 12   # how many played fragments to keep for comparison
 echo_memory_seconds = 20
 # How much a heard slice has to resemble what was just said to count as the
 # assistant's own echo. Lower catches more echo; too low and it ignores you.
@@ -246,6 +247,21 @@ continuation_ms = 1200
 max_continuations = 3
 min_speech_ms = 250      # anything shorter is a cough, not a sentence
 max_utterance_ms = 20000 # hard stop, in case the silence never arrives
+# Echo cancellation. The assistant knows exactly what it played, so it can
+# recognise that audio arriving back at the microphone instead of guessing from
+# loudness. Delay is speaker -> air -> microphone -> capture buffer.
+echo_min_delay_ms = 0
+# Measured on this machine: the echo comes back a median 229ms later, with a
+# spread out to about 780ms, correlating a median 0.53 against what was played.
+echo_max_delay_ms = 650
+echo_correlation = 0.35
+
+# The frames of its own voice that beat the correlation test are scattered;
+# real speech is continuous. So while it is talking, an interruption has to
+# persist for this many frames before it is believed. That turns an imperfect
+# per-frame test into a reliable per-utterance one.
+onset_frames_while_speaking = 6
+
 queue_frames = 500       # ~10s of buffer; oldest dropped rather than blocking
 
 [reflex]
