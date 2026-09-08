@@ -198,6 +198,10 @@ barge_in_while_speaking_words = 4
 # interrupts itself on speakers, lower it if it ignores you on headphones.
 barge_in_duck_db = 18
 
+# Anything longer than this many words gets read back to you before it is saved.
+# Long dictation is where mishearing costs most and where you can check least.
+repeat_back_words = 8
+
 confirm_timeout = 15
 yes_words = ["yes", "yeah", "yep", "yup", "sure", "go ahead", "do it", "okay", "ok", "please do"]
 no_words = ["no", "nope", "dont", "do not", "cancel", "stop", "never mind", "nevermind", "skip"]
@@ -259,3 +263,19 @@ phrases = ["think properly", "think hard", "think about this properly", "deep mo
            "take your time", "really think", "think carefully"]
 # It takes about two seconds, so say something first rather than going silent.
 acknowledgement = "Let me think about that properly."
+
+[working]
+# Working memory: the current thread of work, so "carry on with that" resolves
+# instead of asking what you mean. Expires, because a stale plan is worse than
+# no plan.
+expires_hours = 20
+keep_deferred = 4
+
+[corrections]
+# How many times you have to say the same "no, don't do that" before Zetsu asks
+# whether to remember it for good. Nothing is promoted without asking — memory
+# that rewrites itself behind your back is the thing to avoid.
+promote_after = 2
+# How alike two complaints must be to count as the same one. People do not
+# object in identical words twice.
+same_complaint = 0.5

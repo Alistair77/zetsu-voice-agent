@@ -15,6 +15,7 @@ from pathlib import Path
 
 import memory
 import rails
+import working
 from config import CONFIG, STATE
 
 TODOS = STATE / "todos.json"
@@ -210,6 +211,36 @@ def recall():
     return "\n".join(f"{i}. {fact}" for i, fact in enumerate(current, 1))
 
 
+# --- what we are doing right now ---------------------------------------------
+# Not gated: this is the assistant's own scratchpad about the conversation, not
+# a change to anything of yours. It is visible on the dashboard and expires.
+
+@tool(
+    "Record what you and the user are working on now. Call this when they say "
+    "what they want to work on, or when the subject clearly changes.",
+    what="The current piece of work, in a few words.",
+)
+def set_focus(what):
+    return working.describe(working.set_focus(what))
+
+
+@tool(
+    "Note something to do after the current thing. Use when the user says "
+    "'after that' or 'then we should'.",
+    what="The thing to come back to, in a few words.",
+)
+def queue_next(what):
+    return working.describe(working.queue_next(what))
+
+
+@tool(
+    "Say what you are both currently working on. Use when they ask what you were "
+    "doing, where you were, or to carry on.",
+)
+def current_work():
+    return working.describe() or "Nothing on the go at the moment."
+
+
 # --- the world outside this program ------------------------------------------
 # Read-only lookups run free. Anything that writes to a real calendar or a real
 # reminder list is gated like every other consequential action.
@@ -330,6 +361,24 @@ def system_status():
         f"Battery {percent} ({charging}). {free} of disk free. "
         f"It is {datetime.now():%H:%M on %A %d %B}."
     )
+
+
+# --- when the small brain is out of its depth --------------------------------
+
+@tool(
+    "Ask a much larger model. Use this when the question needs real reasoning, "
+    "when you are genuinely unsure of the answer, or when getting it wrong would "
+    "matter. Do not use it for anything you already know — it is slower.",
+    question="The question, written out in full with everything needed to answer it.",
+)
+def think_harder(question):
+    import brain
+
+    answer = brain.claude_cli_respond(
+        [{"role": "user", "content": question}], None, lambda piece: None
+    )
+    rails.log("ESCALATED", question[:90])
+    return answer.get("content") or "The bigger model had nothing to add."
 
 
 # --- running them ------------------------------------------------------------

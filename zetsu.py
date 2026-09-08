@@ -18,6 +18,7 @@ import threading
 import time
 
 import brain
+import corrections
 import live
 import rails
 import reflex
@@ -158,6 +159,11 @@ def main():
             break
         if handle_command(text):
             continue
+
+        if corrections.looks_like_correction(text):
+            if ready := corrections.note(text):
+                print(f"  ↺ you've said that {ready['times']}x — I can remember it "
+                      f"for good if you ask me to\n")
 
         if instant := reflex.handle(text):
             print(f"{NAME} › {instant}\n")
@@ -482,7 +488,7 @@ def wake_main():
         summary = gate["summary"]
         print(f"\n  ⚠︎  {NAME} wants to: {summary}")
         speaker.stop()
-        speaker.say_now(f"I want to {summary.split('(')[0].replace('_', ' ')}. Say yes or no.")
+        speaker.say_now(_spoken_gate(summary))
         speaker.wait()
         mic.flush()
 
@@ -509,6 +515,13 @@ def wake_main():
     def answer(said):
         """Answer one turn while staying open to being talked over."""
         print(f"you › {said}")
+
+        if corrections.looks_like_correction(said):
+            if ready := corrections.note(said):
+                corrections.mark_offered(ready["key"])
+                speaker.say_now(
+                    "You've told me that more than once. Want me to remember it for good?"
+                )
 
         # Deterministic commands never reach the model. Timers speak for
         # themselves when they fire, through the same voice.
@@ -706,6 +719,22 @@ def misses_main():
     for phrase, times in counts.most_common(12):
         print(f"  {times:>3}x  {phrase!r}   closest {best[phrase]:.2f}")
     print("\nAdd the ones that were really you, to [wake] variants in config.toml.")
+
+
+# Long dictation is exactly where mishearing costs the most, and where you are
+# least able to check — so it gets read back before anything is written.
+CONTENT = __import__("re").compile(r"(?:text|fact|title|question)='([^']*)'")
+
+
+def _spoken_gate(summary):
+    action = summary.split("(")[0].replace("_", " ")
+    found = CONTENT.search(summary)
+    content = found.group(1) if found else ""
+    if content and len(content.split()) >= CONFIG["wake"]["repeat_back_words"]:
+        return f"I heard: {content}. Shall I {action}? Say yes or no."
+    if content:
+        return f"I want to {action}: {content}. Say yes or no."
+    return f"I want to {action}. Say yes or no."
 
 
 def report_stages(marks, speaker):
