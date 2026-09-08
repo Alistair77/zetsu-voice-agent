@@ -12,6 +12,7 @@ load, speech degrades to `say` rather than going silent.
 """
 
 import difflib
+import itertools
 import queue
 import re
 import subprocess
@@ -36,6 +37,9 @@ BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 OPENING = re.compile(r"(?<=[,;:])\s+|(?<=[.!?])\s+|\n+")
 
 
+_counter = itertools.count()
+
+
 def _words(text):
     """Lowercase words, punctuation dropped — the air mangles everything else."""
     return [
@@ -51,7 +55,8 @@ class Speaker:
     def __init__(self, cfg=CONFIG):
         self.voice = cfg["voice"]["say_voice"]
         self.rate = str(cfg["voice"]["say_rate"])
-        self.queue = queue.Queue()
+        self.queue = queue.Queue()      # text waiting to be synthesised
+        self.audio = queue.Queue()      # synthesised files waiting to be played
         self.buffer = ""
         self.chunk_chars = cfg["voice"].get("speak_chunk_chars", 120)
         self.opening_chars = cfg["voice"].get("speak_opening_chars", 45)
@@ -63,8 +68,11 @@ class Speaker:
         self.first_audio = None   # when sound actually reached the speakers
         self.engine = cfg["voice"].get("engine", "say")
         self.piper = self._load_piper() if self.engine == "piper" else None
-        self.worker = threading.Thread(target=self._drain, daemon=True)
+        self.workspace = tempfile.TemporaryDirectory()
+        self.worker = threading.Thread(target=self._synthesise_loop, daemon=True)
         self.worker.start()
+        self.player = threading.Thread(target=self._play_loop, daemon=True)
+        self.player.start()
 
     def _load_piper(self):
         """Load the neural voice once. Falling back is better than falling over."""
@@ -125,17 +133,6 @@ class Speaker:
     def reset_timing(self):
         self.first_audio = None
 
-    def _say(self, text):
-        """The engine seam. Everything above this is engine-agnostic."""
-        self.remember_saying(text)
-        try:
-            if self.piper is not None:
-                self._speak_neural(text)
-            else:
-                self._speak_system(text)
-        finally:
-            self.current = None
-
     def _speak_system(self, text):
         if self.first_audio is None:
             self.first_audio = time.time()
@@ -146,40 +143,66 @@ class Speaker:
         )
         self.current.wait()
 
-    def _speak_neural(self, text):
-        """Synthesise to a file, then play it. Deleted straight after.
 
-        Kept as a separate process for playback specifically so `stop()` can
-        terminate it — barge-in has to be able to cut a sentence off mid-word.
+    def _synthesise_loop(self):
+        """Turn text into audio files, continuously.
+
+        Deliberately separate from playback. Synthesising fragment two while
+        fragment one is still being spoken is what makes a long reply come out
+        as continuous speech instead of a series of gaps: three sequential
+        operations become a pipeline.
         """
-        with tempfile.TemporaryDirectory() as workspace:
-            path = Path(workspace) / "say.wav"
-            try:
-                with wave.open(str(path), "wb") as handle:
-                    self.piper.synthesize_wav(text, handle)
-            except Exception:
-                self._speak_system(text)  # synthesis failed; still say it
-                return
-            if self.first_audio is None:
-                self.first_audio = time.time()
-            self.current = subprocess.Popen(
-                ["afplay", str(path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.current.wait()
-
-    def _drain(self):
         while True:
             text = self.queue.get()
-            if text is None:
-                return
             try:
-                self._say(text)
+                if text is None:
+                    self.audio.put(None)
+                    return
+                self.remember_saying(text)
+                path = self._synthesise(text)
+                self.audio.put((path, text))
             except Exception:
                 pass  # a dead voice must never take the conversation down
             finally:
                 self.queue.task_done()
+
+    def _play_loop(self):
+        while True:
+            item = self.audio.get()
+            try:
+                if item is None:
+                    return
+                path, text = item
+                if self.first_audio is None:
+                    self.first_audio = time.time()
+                self._play(path, text)
+            except Exception:
+                pass
+            finally:
+                self.audio.task_done()
+
+    def _synthesise(self, text):
+        """Text to a playable file. Returns None if the neural voice is not in use."""
+        if self.piper is None:
+            return None
+        path = Path(self.workspace.name) / f"say-{next(_counter)}.wav"
+        try:
+            with wave.open(str(path), "wb") as handle:
+                self.piper.synthesize_wav(text, handle)
+            return path
+        except Exception:
+            return None
+
+    def _play(self, path, text):
+        if path is None:
+            self._speak_system(text)
+            return
+        self.current = subprocess.Popen(
+            ["afplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self.current.wait()
+        self.current = None
+        path.unlink(missing_ok=True)
 
     def feed(self, delta):
         """Take a chunk of streamed text; speak whatever sentences are complete."""
@@ -226,6 +249,7 @@ class Speaker:
 
     def wait(self):
         self.queue.join()
+        self.audio.join()
 
     def is_busy(self):
         """True while anything is queued or actually being spoken.
@@ -233,7 +257,12 @@ class Speaker:
         The wake loop asks this before every capture. Without it the open mic
         hears Zetsu say its own name and answers itself, forever.
         """
-        return bool(self.buffer) or not self.queue.empty() or self.current is not None
+        return bool(
+            self.buffer
+            or not self.queue.empty()
+            or not self.audio.empty()
+            or self.current is not None
+        )
 
     def close(self):
         """Shut the speech thread down before the interpreter exits.
@@ -245,18 +274,23 @@ class Speaker:
         """
         self.stop()
         self.queue.put(None)
-        if self.worker.is_alive():
-            self.worker.join(timeout=3)
+        for thread in (self.worker, self.player):
+            if thread.is_alive():
+                thread.join(timeout=3)
         self.piper = None
+        self.workspace.cleanup()
 
     def stop(self):
         """Shut up immediately. The user starting a new turn always wins."""
         self.buffer = ""
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-                self.queue.task_done()
-            except queue.Empty:
-                break
+        for pending in (self.queue, self.audio):
+            while not pending.empty():
+                try:
+                    item = pending.get_nowait()
+                    if isinstance(item, tuple) and item[0] is not None:
+                        item[0].unlink(missing_ok=True)
+                    pending.task_done()
+                except queue.Empty:
+                    break
         if self.current and self.current.poll() is None:
             self.current.terminate()
