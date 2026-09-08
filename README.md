@@ -404,7 +404,13 @@ guessing.
 ./.venv/bin/python zetsu.py --calibrate # teach it how you say the wake word
 ./.venv/bin/python zetsu.py --misses    # what nearly woke it
 ./.venv/bin/python zetsu.py --selftest  # no mic, no model, no network needed
+./.venv/bin/python test_regressions.py  # every bug it has ever had, pinned
 ```
+
+Twenty failures were found the hard way — by running it, listening to it, and
+attacking it. Each one is now a test. A fix lasts until someone refactors past
+it; a test lasts. The suite earned its keep on the first run, catching a fix that
+had been silently lost in a rewrite.
 
 Console commands while talking: `/pause` `/resume` `/audit` `/status` `/quit`.
 

@@ -152,6 +152,25 @@ credible but not yet confirmed as one continuous observation.
 
 ---
 
+## 5.4 All twenty bugs are now regression tests
+
+`test_regressions.py` holds one test per failure in the table above, named for
+what it must never do again. Most are behavioural — they run the real code and
+assert on what it does. A few are structural, asserting a decision is still
+present in the source, used only where reproducing the failure would need a
+microphone, a wedged process or a live terminal. Those are labelled, because a
+structural check is weaker evidence and pretending otherwise would repeat the
+mistake of the sandbox that was not a sandbox.
+
+**It justified itself on the first run.** REG-14 failed immediately: the fix for
+"saying 'Yes?' ate the question" had been silently lost in the rewrite to
+streaming audio, and had come back in a new form — it now flushed the microphone,
+discarding the half of the sentence you actually wanted. Nobody would have noticed
+until it happened in use again.
+
+That is the whole argument for this file. A fix lasts until someone refactors past
+it. A test lasts.
+
 ## 5.5 Two lessons that generalise
 
 ### A small model imitates whatever shape you show it

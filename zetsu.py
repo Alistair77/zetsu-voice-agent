@@ -739,10 +739,18 @@ def wake_main():
                 awake = True
                 print(f'  ◉ awake ("{phrase}")')
                 if len(spoken.split()) < 2:
-                    speaker.say_now("Yes?")
-                    speaker.wait()
-                    mic.flush()
-                    spoken = ""
+                    # Listen before prompting. People say the name and the
+                    # question in one breath, and saying "Yes?" here flushes the
+                    # microphone — throwing away the half you actually wanted.
+                    # This fix was written once and lost in the move to
+                    # streaming; REG-14 is why it came back.
+                    spoken = listen(time.time() + CONFIG["wake"]["awake_chunk_seconds"] * 2)
+                    if trailing := ears.find_wake(spoken):
+                        spoken = trailing
+                    if not spoken:
+                        speaker.say_now("Yes?")
+                        speaker.wait()
+                        mic.flush()
             else:
                 spoken, pending = pending, ""
 
