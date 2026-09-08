@@ -19,6 +19,7 @@ import time
 
 import brain
 import corrections
+import jobs
 import live
 import rails
 import reflex
@@ -413,6 +414,15 @@ def wake_main():
         print("Loading the speech model (once — everything after this is fast)…")
         print("  ready." if ears.start_server() else "  falling back to per-chunk loading.")
 
+    import privacy
+
+    if CONFIG["privacy"]["sandbox_subprocesses"] and not privacy.sandbox_works():
+        print("  ⚠︎  the privacy sandbox could not be verified — screen and web")
+        print("      tools are disabled for this session.")
+        rails.log("PRIVACY", "sandbox unverified — reaching tools disabled")
+        for name in ("look_at_screen", "search_web"):
+            tools.REGISTRY.pop(name, None)
+
     speaker = mouth.Speaker()
     mic = ears.StreamMic(prompt=phrase)
     history, marks = [], {}
@@ -458,6 +468,37 @@ def wake_main():
         if heard and settings.get("show_chunks"):
             print(f"    ‹heard› {heard!r}")
         return heard
+
+    def deliver_finished_work():
+        """Come back with the answer to something that was running.
+
+        Phrased through the brain rather than read out raw, so it arrives as
+        "that search is done — Python 3.14" instead of a wall of text.
+        """
+        done = jobs.collect()
+        if not done or speaker.is_busy():
+            return False
+        for job in done:
+            print(f"\n  ✓ {job['label']} finished ({job['took']:.0f}s)")
+            live.set_phase("speaking", job["label"])
+            try:
+                turn(brain.respond, history,
+                     f"[The {job['label']} you started has finished. Result: "
+                     f"{job['result']}] Tell me the answer briefly, as if coming back "
+                     f"to me about it.",
+                     on_delta=lambda piece: (print(piece, end="", flush=True),
+                                             speaker.feed(piece))[0],
+                     on_tool=lambda name, args: None,
+                     confirm=lambda summary: False,
+                     backend_override="ollama")
+                speaker.flush()
+                speaker.wait()
+                print()
+            except Exception as exc:
+                rails.log("JOB", f"could not announce: {exc}")
+            mic.flush()
+            live.set_phase("idle")
+        return True
 
     def pending_notices():
         """Say anything the heartbeat is holding, while the mic is live."""
@@ -647,7 +688,7 @@ def wake_main():
                     near = ears.best_near_miss(heard)
                     if near and settings["similarity"] - 0.22 <= near[1] < settings["similarity"]:
                         rails.log("WAKE-MISS", f"{near[0]!r} ({near[1]:.2f})")
-                    pending_notices()
+                    deliver_finished_work() or pending_notices()
                     continue
                 awake = True
                 print(f'  ◉ awake ("{phrase}")')
@@ -666,6 +707,7 @@ def wake_main():
                 spoken = listen(until)
 
             if not spoken:
+                deliver_finished_work()
                 print(f'  ○ back to sleep — say "{phrase}" to wake me\n')
                 awake = staying = False
                 live.set_phase("idle")
@@ -984,6 +1026,19 @@ def selftest():
         CONFIG["notes"]["roots"] = real_roots
 
     assert rails.screen("perfectly ordinary text", "x")[1] is None
+
+    # 10. private material is out of bounds, enforced in code not by asking
+    import privacy
+
+    for forbidden in ("~/Pictures/a.jpg", "~/Movies/b.mov", "~/.ssh/id_rsa",
+                      "~/Library/Mobile Documents/c.txt", "~/Desktop/scan.png"):
+        assert privacy.is_off_limits(forbidden), forbidden
+    for fine in ("~/Documents/notes.md", "~/Desktop/raw2/README.md"):
+        assert not privacy.is_off_limits(fine), fine
+    assert privacy.safe_roots([_P("~/Pictures"), _P("~/Documents")]) == [_P("~/Documents")]
+    # the fence is the kernel's, not the model's goodwill: verify it holds
+    assert privacy.sandbox_works(), "seatbelt sandbox is not blocking private paths"
+    assert privacy.confine(["x"])[0] == "sandbox-exec"
 
     _sandbox.cleanup()
     print("selftest ok")

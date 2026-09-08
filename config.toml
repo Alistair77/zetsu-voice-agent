@@ -279,3 +279,41 @@ promote_after = 2
 # How alike two complaints must be to count as the same one. People do not
 # object in identical words twice.
 same_complaint = 0.5
+
+[jobs]
+# Work slower than this runs in the background rather than blocking the
+# conversation. Zetsu says roughly how long it will be and comes back with the
+# answer, so you are never left talking into a silence.
+background_over_seconds = 4
+
+[privacy]
+# Places Zetsu must never look, enforced in code rather than asked of the model.
+# A screenshot it takes itself, or a path you hand it deliberately, is fine —
+# that was an instruction. Going through what you already have never was.
+# Enforced by the macOS sandbox, not by asking the model nicely. Verified at
+# startup — if the fence cannot be built, vision and web search stay off.
+sandbox_subprocesses = true
+
+# What Zetsu's own code refuses to open. Broad on purpose.
+never_touch = [
+  "~/Pictures", "~/Movies", "~/Music",
+  "~/Library", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config",
+]
+
+# What the kernel blocks outright for any subprocess. Narrower than the list
+# above, deliberately: denying all of ~/Library also denies the Claude CLI its
+# own credentials, and a tool that cannot log in is not a security win. These
+# are the paths that actually hold private material.
+sandbox_deny = [
+  "~/Pictures", "~/Movies", "~/Music",
+  "~/Library/Mobile Documents",                   # iCloud Drive
+  "~/Library/Containers/com.apple.Photos",
+  "~/Library/Application Support/MobileSync",     # iPhone backups
+  "~/.ssh", "~/.gnupg", "~/.aws",
+]
+# File kinds it will not open even inside allowed folders.
+never_open = [
+  ".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp", ".raw", ".dng",
+  ".mov", ".mp4", ".m4v", ".avi", ".mkv",
+  ".key", ".pem", ".p12", ".keychain", ".kdbx",
+]

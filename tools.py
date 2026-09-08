@@ -13,7 +13,9 @@ import subprocess
 from datetime import date, datetime
 from pathlib import Path
 
+import jobs
 import memory
+import privacy
 import rails
 import working
 from config import CONFIG, STATE
@@ -30,7 +32,7 @@ UNTRUSTED = (
 )
 
 
-def tool(description, confirm=False, screen=False, **params):
+def tool(description, confirm=False, screen=False, slow=0, **params):
     """Register a function as a tool. `params` maps name -> description string.
 
     A name ending in '?' is optional; everything else is required.
@@ -48,6 +50,7 @@ def tool(description, confirm=False, screen=False, **params):
             "function": function,
             "confirm": confirm,
             "screen": screen,
+            "slow": slow,
             "spec": {
                 "type": "function",
                 "function": {
@@ -155,6 +158,7 @@ def search_notes(query):
     notes = CONFIG["notes"]
     roots = [Path(r).expanduser() for r in notes["roots"]]
     roots = [r for r in roots if r.exists()]
+    roots = privacy.safe_roots(roots)   # never search into forbidden ground
     if not roots:
         return "None of the configured note folders exist. Check [notes] in config.toml."
 
@@ -170,7 +174,11 @@ def search_notes(query):
     except subprocess.TimeoutExpired:
         return "That search took too long. Try a more specific phrase."
 
-    lines = found.stdout.splitlines()[: notes["max_results"]]
+    # A match inside something off limits is dropped before it is ever seen.
+    lines = [
+        line for line in found.stdout.splitlines()
+        if privacy.allow(line.split(":", 1)[0], "notes search")
+    ][: notes["max_results"]]
     if not lines:
         return f"Nothing in your notes mentions {query!r}."
     return UNTRUSTED + "\n".join(lines)
@@ -363,6 +371,123 @@ def system_status():
     )
 
 
+# --- eyes, the web, and the inbox --------------------------------------------
+# All three lean on the Claude CLI, which runs as a subprocess against an
+# existing login: no second model resident, no RAM cost. All three are also slow
+# enough to talk about, so they run in the background rather than leaving you in
+# a silence (see jobs.py).
+
+def _ask_claude(prompt, allowed, seconds=120, workdir=None):
+    """Ask the CLI. `workdir` bounds what its Read tool can reach.
+
+    Claude Code's file access is relative to its working directory, so running
+    it inside a directory that holds nothing but the screenshot is a real fence,
+    not an instruction it might reinterpret.
+    """
+    # The prompt goes in on stdin, not as an argument: --allowedTools is
+    # variadic and will happily swallow a trailing prompt as another tool name.
+    command = privacy.confine(
+        ["claude", "-p", "--setting-sources", "", "--model", CONFIG["model"]["cli_model"],
+         "--allowedTools", allowed]
+    )
+    result = subprocess.run(
+        command, input=prompt, capture_output=True, text=True, timeout=seconds,
+        cwd=str(workdir) if workdir else None,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip()[:160] or "the request failed")
+    return " ".join(result.stdout.split())
+
+
+@tool(
+    "Look at what is on the user's screen and answer a question about it. Use "
+    "for 'what is this error', 'what am I looking at', 'read this to me'.",
+    slow=12,
+    question="What they want to know about what is on screen.",
+)
+def look_at_screen(question):
+    import tempfile
+
+    # An isolated directory holding one file: the screenshot Zetsu just took.
+    # Nothing else is reachable from in there, so "read the image" cannot become
+    # "read anything else on this machine".
+    with tempfile.TemporaryDirectory() as fence:
+        shot = Path(fence) / "screen.png"
+        grab = subprocess.run(["screencapture", "-x", str(shot)],
+                              capture_output=True, timeout=30)
+        if grab.returncode != 0 or not shot.exists():
+            return ("I can't take a screenshot — grant Screen Recording to your "
+                    "terminal in System Settings > Privacy & Security.")
+        return _ask_claude(
+            f"Read the image ./screen.png in this directory and answer, in two "
+            f"sentences at most, spoken aloud rather than written: {question}",
+            "Read",
+            workdir=fence,
+        )
+    # the directory and the picture of your screen go with it
+
+
+@tool(
+    "Search the web for current information. Use for news, prices, today's "
+    "facts, or anything you might be out of date on. Not for things you know.",
+    slow=18,
+    query="What to search for, as a plain question.",
+)
+def search_web(query):
+    return _ask_claude(
+        f"Search the web and answer in two sentences at most, spoken aloud "
+        f"rather than written, no links or lists: {query}",
+        "WebSearch,WebFetch",
+    )
+
+
+@tool(
+    "Read the most recent emails in the user's inbox — senders and subjects. "
+    "Use when they ask what has come in or whether anything needs them.",
+    slow=6,
+    count_opt="How many to look at. Defaults to 5.",
+)
+def read_email(count="5"):
+    limit = max(1, min(int(str(count) or 5), 15))
+    script = f'''
+    tell application "Mail"
+      set output to ""
+      set box to inbox
+      set total to count of messages of box
+      set stop to {limit}
+      if total < stop then set stop to total
+      repeat with i from 1 to stop
+        set m to message i of box
+        set output to output & (sender of m) & " — " & (subject of m) & linefeed
+      end repeat
+      return output
+    end tell'''
+    found = _osascript(script, timeout=45)
+    return found or "The inbox looks empty."
+
+
+@tool(
+    "Write an email and leave it in Mail as a DRAFT for the user to check and "
+    "send themselves. You can never send one.",
+    confirm=True,
+    to="Who it goes to.",
+    subject="The subject line.",
+    body="What it says.",
+)
+def draft_email(to, subject, body):
+    safe = [value.replace('"', "'").replace("\\", "") for value in (to, subject, body)]
+    _osascript(
+        f'''tell application "Mail"
+             set note to make new outgoing message with properties ¬
+               {{subject:"{safe[1]}", content:"{safe[2]}", visible:true}}
+             tell note to make new to recipient at end of to recipients ¬
+               with properties {{address:"{safe[0]}"}}
+           end tell''',
+        timeout=40,
+    )
+    return f"Draft to {to} is open in Mail. You send it — I won't."
+
+
 # --- when the small brain is out of its depth --------------------------------
 
 @tool(
@@ -411,6 +536,16 @@ def run(name, arguments, confirmer):
     # Whether an action worked is decided here, by what actually happened — never
     # by the model reading a hopeful-sounding string. Every result is stamped, and
     # the system prompt forbids claiming success without an [OK].
+    if entry["slow"] >= CONFIG["jobs"]["background_over_seconds"]:
+        label = name.replace("_", " ")
+        job_id, estimate = jobs.start(
+            label, lambda: str(entry["function"](**arguments)), entry["slow"]
+        )
+        return (f"[STARTED] {label} is running in the background, about "
+                f"{estimate}s. Tell the user roughly how long and that you will "
+                f"come back with it. Do not invent the answer — you do not have it "
+                f"yet. Carry on talking to them about anything else.")
+
     try:
         result = f"[OK] {entry['function'](**arguments)}"
     except TypeError as exc:
