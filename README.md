@@ -288,16 +288,95 @@ fired into the void, respect quiet hours, and can now be **spoken aloud** when t
 mic is live. `/pause` — or Mute on the dashboard — stops all of it without tearing
 anything down.
 
+### It waits for you to finish
+Turns do not end on a fixed silence. People pause mid-sentence to think, and being
+cut off there is worse than any latency it saves. If a transcript stops on a
+dangling word — "for my", "in the", "and" — it listens again and joins the pieces.
+Grammatical incompleteness is a cheap, strong signal that you are still going, so
+the extra wait is only paid when you actually are.
+
+### It has a character, not a job description
+"Be helpful" produces a call-centre voice. What changes the output is naming what
+*not* to do: no "Certainly", no repeating your request back, no reflexive apology,
+no "Done." every single time. It is allowed to say it does not know, and allowed to
+disagree — one sentence, then it does what you asked. Humour is dry, occasional,
+and never while something is in progress or has gone wrong.
+
+### It remembers what you are doing
+Separate from long-term facts about you, it tracks the shape of the current work:
+what you are on, what is next, what got set aside. So "carry on with that" resolves
+instead of asking what you mean. It expires after a day, because a stale objective
+is worse than none.
+
+### It learns from being corrected
+Told off once, it notes it. Twice, it becomes a candidate. Often enough, it offers
+to remember it for good — and you decide. Nothing is promoted silently. Complaints
+are matched by overlap rather than exact wording, since nobody objects in identical
+words twice.
+
+### Deterministic things are not left to a language model
+Time, date and timers are answered by code. Not for speed — the model replies in
+64 ms — but because a timer should never depend on a 3B parsing "ten" correctly.
+The model handles ambiguity and conversation; code handles operations with exactly
+one right answer.
+
+### It tells you when something will take a while
+Looking at your screen takes about seven seconds. A web search takes fifteen.
+Blocking the conversation for that is the difference between an assistant and a
+progress bar you cannot see. Slow work runs in the background: it says roughly how
+long, carries on talking to you, and comes back with the answer when it has it.
+
+```
+you  › search the web for the weather in London
+zetsu› Checking that now — about 18 seconds. I'll come back to you on it.
+you  › what's two plus two
+zetsu› 4.
+       ✓ search web — finished in 13s
+zetsu› That London weather — it's 11 degrees and raining.
+```
+
+### A bigger brain without a bigger machine
+`[model] backend = "auto"` keeps turns local and escalates only when the request
+needs it. Say **"think properly"** and it goes to the Claude CLI, which runs as a
+subprocess against your existing login — **no second model resident, no extra RAM**.
+That is the answer to wanting more intelligence on 8 GB: not two models in memory,
+one local and one remote. The model can also reach for it itself, via `think_harder`,
+when it knows it is out of its depth.
+
+### It reads long dictation back to you
+Anything over eight words is repeated before it is saved:
+
+> *"I heard: make an advertisement for my mother's name change document in the
+> newspaper. Shall I add that? Say yes or no."*
+
+Long dictation is exactly where mishearing costs most and where you can check least.
+
 ### A voice that sounds like a person
 Speech runs through **Piper**, a neural voice that runs locally — no account, no
 network, no per-word cost. Its model is loaded once and kept in memory: 0.07–0.24s a
 sentence, against 0.95s if reloaded each time. `say` remains the automatic fallback.
 
 ### It can reach your actual life
-Beyond its own todo list, it reads your **real calendar**, reads and writes **Apple
-Reminders** (so things reach your phone), and reports on the machine itself — battery,
-disk, time. Calendar and reminder *writes* are gated like everything else
-consequential; reads run free.
+Beyond its own todo list it reads your **real calendar**, reads and writes **Apple
+Reminders** so things arrive on your phone, reads your **inbox**, **looks at your
+screen**, and **searches the web**. Email can be drafted but **never sent** — that
+is not a permission it lacks, it is a capability that does not exist.
+
+### Your private things are off limits, and that is enforced by the kernel
+Things it creates itself, or a path you hand it deliberately, are fair game. What
+you already have is not.
+
+The first version of this ran the Claude CLI inside a temporary folder holding only
+its own screenshot, on the assumption that its file access was bounded by the
+working directory. **That was tested, and it read a file outside anyway.** The
+sandbox was decoration.
+
+So the boundary is macOS seatbelt. Photo and video libraries, iCloud Drive, iPhone
+backups and key material are denied to any subprocess at the kernel level — a model
+that tries is simply told "operation not permitted". Verified by attacking it: given
+both `Read` and `Bash` and told to list the photo library, it answers `BLOCKED`. The
+fence is checked at startup, and if it cannot be proven, the screen and web tools are
+removed for the session rather than trusted.
 
 ### A dashboard that shows what it is doing
 `--dash` serves a local page with a WebGL ring that reflects the live state: still
@@ -329,6 +408,22 @@ guessing.
 
 Console commands while talking: `/pause` `/resume` `/audit` `/status` `/quit`.
 
+### The twenty tools
+
+| | |
+|---|---|
+| **Its own list** | `list_todos` `add_todo` 🔒 `complete_todo` 🔒 |
+| **Your files** | `search_notes` |
+| **Memory** | `remember` 🔒 `forget` 🔒 `recall` |
+| **This conversation** | `set_focus` `queue_next` `current_work` |
+| **Your real life** | `whats_on` `add_calendar_event` 🔒 `apple_reminders` `add_apple_reminder` 🔒 |
+| **Reaching out** | `look_at_screen` `search_web` `read_email` `draft_email` 🔒 |
+| **This machine** | `system_status` |
+| **When it is stuck** | `think_harder` |
+
+🔒 asks first. Reads run free. Adding a capability means writing one function and
+decorating it — the conversation loop never changes.
+
 ---
 
 ## The files
@@ -343,6 +438,11 @@ Console commands while talking: `/pause` `/resume` `/audit` `/status` `/quit`.
 | `memory.py` | durable facts, as plain text |
 | `heartbeat.py` | the schedule, held notices, quiet hours |
 | `rails.py` | gate policy, audit log, kill switch, injection screening |
+| `privacy.py` | the kernel-enforced boundary around private material |
+| `reflex.py` | deterministic commands answered without the model |
+| `jobs.py` | slow work, run in the background and reported when done |
+| `working.py` | what you are both doing right now |
+| `corrections.py` | learning from being told off, on a ladder |
 | `live.py` | what it is doing right now, for the dashboard |
 | `dash.py` | the local page |
 | `config.py` | settings and paths, in one place |

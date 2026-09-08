@@ -120,17 +120,19 @@ remember function."* That chain was never tested deliberately; it worked anyway.
 
 ## 5. Known open problems
 
-### 5.1 It cuts you off mid-sentence — CRITICAL
+### 5.1 It cut you off mid-sentence — FIXED
 **Reported in real use.** Dictating *"remind me to make an advertisement for my
 mother's name change document in the newspaper"* ended the turn before "in the
-newspaper" and jumped straight to asking whether to remember it.
+newspaper".
 
-**Cause:** `hangover_ms = 400`. Any thinking pause longer than 0.4 s is read as the
-end of the sentence. That value was chosen to minimise latency and is simply wrong
-for natural speech, where mid-sentence pauses of 0.5–1.0 s are normal — especially in
-longer, composed sentences.
+**Cause:** `hangover_ms = 400`, chosen to minimise latency and simply wrong for
+speech, where mid-sentence pauses of 0.5–1.0 s are normal.
 
-**This is the most important open issue.** Being cut off is worse than waiting.
+**Fix:** endpointing is adaptive rather than a fixed silence. Base wait raised to
+800 ms, and when a transcript ends on a dangling word ("for my", "in the", "and") it
+listens again and joins the pieces. Grammatical incompleteness is a cheap, strong
+signal that someone is still talking, so the extra latency is only paid when they
+are. Verified acoustically with that exact sentence and a real pause in the middle.
 
 ### 5.2 Barge-in on laptop speakers is still imperfect
 Ducking the microphone while speaking took self-interruptions from 5 to 0 in one
@@ -150,6 +152,33 @@ credible but not yet confirmed as one continuous observation.
 
 ---
 
+## 5.5 Two lessons that generalise
+
+### A small model imitates whatever shape you show it
+Tool outcomes were stamped `[OK]` / `[FAILED]` / `[BLOCKED]` so the model could never
+claim success on its own. It began copying the format into its own replies — "what is
+two plus two" returned `[OK] {"result": 4}`. Renaming the marker changed nothing.
+Instructing it not to copy them changed nothing.
+
+The fix was to remove the pattern, not to forbid it. A tool that worked now returns
+its answer and nothing else; only outcomes that must not be mistaken for success
+carry wording, and that wording is a plain sentence rather than a token. **Design the
+input so the wrong behaviour is not available, rather than asking a 3B for
+discipline.**
+
+### An assumed boundary is not a boundary
+The first privacy sandbox ran the Claude CLI inside a temporary directory holding
+only its own screenshot, on the assumption that file access was bounded by the
+working directory. Tested by asking it for an absolute path elsewhere, **it read the
+file.**
+
+The replacement is macOS seatbelt, which denies the reads at the kernel. It was then
+attacked deliberately — given both `Read` and `Bash` and told to list the photo
+library — and answered `BLOCKED`. **A security boundary you have not attacked is a
+guess.**
+
+---
+
 ## 6. Current capability
 
 **Runs entirely locally.** No API keys, no accounts, no audio leaving the machine.
@@ -161,47 +190,47 @@ binaries.
   indefinitely, "bye bye" ends it
 - Barge-in: talk over it and it stops in 85 ms
 - Neural voice, local
-- Tools: todos, notes search, memory, **real calendar**, **Apple Reminders**, system status
+- **Twenty tools**: todos, notes search, memory, working memory, real calendar, Apple
+  Reminders, inbox, screen vision, web search, email drafting, system status, escalation
 - Durable memory in plain text you can edit by hand
 - Heartbeat that can speak up on its own, with quiet hours and held notices
 - Confirmation gate on everything consequential, per-action, defaulting to no
 - Prompt-injection screening
 - Full audit trail, kill switch, live dashboard
-- Two brains: local by default, Claude for hard requests
+- Two brains: local by default, Claude for hard requests — **no second model resident**
 - RAM released on exit
+- **Adaptive endpointing** that waits when a sentence is obviously unfinished
+- **Character**: allowed to disagree, to say it does not know, dry humour with rules
+- **Working memory** — "carry on with that" resolves
+- **Correction learning** on a ladder, never promoted silently
+- **Deterministic commands** — time, date, timers answered by code
+- **Background work** with spoken time estimates, in voice and in the terminal
+- **Repeat-back** of long dictation before anything is saved
+- **Kernel-enforced privacy fence** around photos, video, iCloud and keys
 
 ---
 
 ## 7. Where to go next
 
-### Immediate — fix what is broken
-1. **Adaptive endpointing.** Do not end a turn on a fixed silence. Extend the window
-   when the transcript ends on a dangling word ("for my", "in the", "to make an") —
-   grammatical incompleteness is a strong signal that the speaker is still going.
-2. **Raise the base hangover** to ~800 ms, with the dangling-word check reclaiming the
-   latency where the sentence clearly ended.
-3. **Confirm 500 ms in one real turn** on an idle machine with a warm model.
+### Done since this report was first written
+Adaptive endpointing · character and humour rules · working memory · correction
+learning · escalation when unsure · deterministic commands · repeat-back · screen
+vision · web search · email · background work with time estimates · the privacy fence.
 
-### High value — reliability over speed
-4. **Confidence thresholds.** High confidence executes, medium asks for clarification,
-   low routes to Claude. This compensates for a small brain without slowing anything.
-5. **Deterministic intent parsing.** Timers, alarms and "stop" should not depend on a
-   3B model's judgement. Code for deterministic operations, the model for ambiguity.
-6. **Repeat-back for long dictation.** When capturing something detailed, read it back
-   before acting.
-
-### Capability — make it genuinely useful
-7. **Email** (read and draft, never send unprompted)
-8. **Vision** — screenshot understanding, "what's this error?"
-9. **Music and media control**
-10. **Web search** for facts the local model does not have
-11. **Files** — find, move, summarise
-12. **Home automation** if there is anything to control
-
-### Polish
-13. **Heartbeat priority** — background work must never delay the voice loop
-14. **Anticipation** — "meeting in 10 minutes, traffic is bad"
-15. **Personal voice** — Piper can be fine-tuned
+### Still open
+1. **Confirm 500 ms in one real turn** on an idle machine with a warm model. Every
+   stage has been measured cleanly; a single uninterrupted observation has not.
+2. **Echo cancellation.** Barge-in on laptop speakers is a probabilistic defence.
+   Headphones remove the problem; proper AEC would remove it without them.
+3. **Wake-word calibration on a real voice.** `--calibrate` has still only been run
+   against a synthesised one.
+4. **Heartbeat priority** — background work must never delay the voice loop.
+5. **Anticipation** — "meeting in 10 minutes, traffic is bad."
+6. **Watch-me workflows** — observe a repeated sequence, offer to automate it.
+7. **Media and browser control**, files, home automation.
+8. **A quality score**, not just a latency budget: heard correctly, right intent,
+   right tool, completed, natural, did not interrupt, did not hallucinate. Then
+   versions can be compared honestly instead of by feel.
 
 ---
 
@@ -218,5 +247,11 @@ and does not anticipate.
 the safety rails are real and have been tested under stress, and every performance
 claim in this document is a measurement rather than an estimate.
 
-**What to watch:** the temptation to add capability before fixing the endpointing.
-Being cut off mid-sentence will annoy a user far more than a missing integration.
+**What to watch:** the temptation to add capability before fixing what is broken.
+Being cut off mid-sentence annoyed the owner more than any missing integration would
+have — and it was found by using the thing, not by reading it.
+
+**The pattern across every bug in this document:** almost none were found by
+inspection. They were found by running it, listening to it, and attacking it. The two
+most dangerous — a model quietly copying its own safety markers, and a sandbox that
+was not a sandbox — both looked correct in the source.
