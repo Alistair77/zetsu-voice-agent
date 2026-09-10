@@ -177,7 +177,7 @@ awake_chunk_seconds = 1.2
 # Consecutive slices share this much audio, so a word spoken across the join is
 # still complete in one of them. Costs a little CPU, buys reliable waking.
 chunk_overlap_seconds = 0.7
-show_chunks = true      # print every slice it hears — for debugging the mic
+show_chunks = false     # print every slice it hears — turn on when the mic misbehaves
 command_seconds = 6      # how long you get to speak after it wakes
 
 # Full duplex is possible only when the microphone does not hear the assistant's

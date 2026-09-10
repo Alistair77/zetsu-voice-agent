@@ -498,6 +498,24 @@ foundation:
 ./.venv/bin/python zetsu.py
 ```
 
+## Make it yours
+
+Four things worth changing before anything else, all in `config.toml`:
+
+| | |
+|---|---|
+| `[wake] phrase` | Your wake word. Then run `--calibrate` — whisper spells a name differently every time, and three samples of *your* voice fixes that |
+| `[notes] roots` | Where it may look for your notes. It never searches outside these |
+| `[agent] character` | How it talks. This is prompt text, not code — rewrite it |
+| `[privacy] never_touch` | What it must never open. Add anything you keep private |
+
+Then talk to it in text first. Voice is a layer on a working agent, never the
+foundation:
+
+```bash
+./.venv/bin/python zetsu.py
+```
+
 ## Configuration
 
 Everything tunable lives in `config.toml` — the model, the voice, the wake word and
