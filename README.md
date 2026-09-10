@@ -518,3 +518,17 @@ means nothing loaded.
 
 Echo suppression is good enough that laptop speakers work. Headphones make the
 problem disappear entirely, and barge-in becomes flawless.
+
+---
+
+## Licence
+
+Apache 2.0. Use it, change it, build on it — keep the notice and state what you
+changed.
+
+## Credit where it is due
+
+Everything here stands on work other people gave away: **Ollama** and **Qwen2.5**
+for the brain, **whisper.cpp** for the ears, **Piper** for the voice, and
+**ffmpeg** for everything that moves audio around. None of this would run on a
+laptop without them.
