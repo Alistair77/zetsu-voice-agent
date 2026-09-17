@@ -407,10 +407,12 @@ guessing.
 ./.venv/bin/python test_regressions.py  # every bug it has ever had, pinned
 ```
 
-Twenty failures were found the hard way — by running it, listening to it, and
-attacking it. Each one is now a test. A fix lasts until someone refactors past
-it; a test lasts. The suite earned its keep on the first run, catching a fix that
-had been silently lost in a rewrite.
+Every bug it has ever had is a test — thirty-nine of them: twenty found by using
+it, and the rest from an independent audit of the source. Both suites run inside
+a sandbox that redirects every file the program persists to, and the regression
+suite hashes the real state directory before and after, so running the tests
+can never touch your memory, your todos or your audit log. A fix lasts until
+someone refactors past it; a test lasts.
 
 Console commands while talking: `/pause` `/resume` `/audit` `/status` `/quit`.
 

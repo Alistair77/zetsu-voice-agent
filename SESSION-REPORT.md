@@ -152,7 +152,7 @@ credible but not yet confirmed as one continuous observation.
 
 ---
 
-## 5.4 All twenty bugs are now regression tests
+## 5.4 Every bug is a regression test
 
 `test_regressions.py` holds one test per failure in the table above, named for
 what it must never do again. Most are behavioural — they run the real code and
@@ -195,6 +195,74 @@ The replacement is macOS seatbelt, which denies the reads at the kernel. It was 
 attacked deliberately — given both `Read` and `Bash` and told to list the photo
 library — and answered `BLOCKED`. **A security boundary you have not attacked is a
 guess.**
+
+---
+
+## 5.6 The audit
+
+Six independent reviewers were pointed at the source — correctness, safety,
+conversation quality, latency, maintainability, and the gap between what the
+README claims and what the tests prove — each finding to be put through an
+adversarial refutation pass before it counted.
+
+**The first result was wrong.** It reported that nothing survived. In fact a
+session limit killed six of the ten agents, including every verifier, and the
+script treated a verifier that never answered as a verdict of "not real". Twenty-
+eight findings were sitting in the run's journal. They were recovered and
+verified by hand instead.
+
+| | found | refuted | already fixed | fixed |
+|---|---|---|---|---|
+| critical | 0 | — | — | — |
+| high | 12 | 1 | — | 11 |
+| medium | 11 | — | 2 | 9 |
+| low | 5 | — | 1 | 4 |
+
+Plus one found during the work: "what time is it and what's on my todo list"
+answered the time and silently dropped the rest.
+
+The refuted finding claimed voice mode never pins the local model. It does; the
+reviewer stopped reading the config twelve lines too early — exactly the kind of
+error the dead verifiers existed to catch.
+
+**The most serious findings**
+- The confirmation gate survived a barge-in, so a "yes" meant for one action
+  could authorise a tool from an interrupted turn. Rebuilt so every request has
+  its own identity, and reproduced with real threads.
+- Injection screening covered one tool in twenty, and background results
+  bypassed it entirely.
+- Conversations were silently truncated: no context size was set, and the prompt
+  and tool definitions already consumed most of Ollama's default window.
+- Interrupting threw away both the question and the partial answer, so "no, not
+  that one" arrived with nothing to refer to.
+- The tests wrote into the real audit log — including a false privacy alert —
+  and the selftest only passed because the owner's todo list said "oat milk".
+
+**What doing the fixes taught**
+
+*A structural test pins names, not behaviour.* REG-02 checked for two variable
+names and failed the moment they were replaced by something safer. Worse, REG-25
+checked that the text `check_fence()` appeared in each mode — and passed while a
+refactor had made the start-up function call itself forever. Every mode would
+have crashed at launch with the suite green. It now actually starts up, and was
+confirmed to fail when the bug was reintroduced on purpose. Structural tests went
+from six to four over this work; the ones that remain are labelled.
+
+*Isolation has to be total, and held to a total check.* Test state was redirected
+one file at a time, twice, and both times something was missed. There is now a
+single list of every persisted file, and the suite hashes the real directory
+before and after running. The first version of that check escaped its own
+sandbox — it exited a context manager that cannot be re-entered — and every later
+test ran against real state.
+
+*Refactoring for testability pays immediately.* The 370-line voice loop became a
+class, converted with the tokenizer so only identifiers changed. Two tests that
+could only search its source became tests that drive it.
+
+*Broad replacements need reading back.* Consolidating duplicated start-up code
+produced both a self-recursive function and a spoken prompt that would have said
+the literal text "{answer_by}". Neither was caught by a test; both by reading the
+diff.
 
 ---
 
