@@ -39,6 +39,16 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
     History is replaced only once the turn completes, so a failed turn leaves no
     dangling user message behind.
     """
+    # Bound the conversation. num_ctx buys room, but history still grows every
+    # turn and every tool result, and past the window Ollama silently drops the
+    # oldest tokens — which are the system prompt and the tool definitions.
+    keep = cfg["model"]["history_messages"]
+    if len(history) > keep:
+        trimmed = history[-keep:]
+        while trimmed and trimmed[0]["role"] != "user":
+            trimmed = trimmed[1:]      # never start mid-exchange
+        history[:] = trimmed
+
     if backend_override:
         backend, why = backend_override, "voice realtime preference"
     else:
@@ -54,7 +64,7 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
 
     # The moment words start arriving it is no longer thinking, it is answering.
     # The dashboard changes colour on this, so it has to fire on the first chunk.
-    said, last_write = [], [0.0]
+    said, last_write, spoken_so_far = [], [0.0], []
 
     def watched(piece):
         """Flip to 'replying' on the first word, then update at 5fps.
@@ -66,17 +76,40 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
         if not piece:
             return
         said.append(piece)
+        spoken_so_far.append(piece)
         now = time.time()
         if len(said) == 1 or now - last_write[0] > 0.2:
             last_write[0] = now
             live.set_phase("speaking", "".join(said)[-160:], backend)
 
+    def remember_interrupted():
+        """Keep what was actually said before the interruption.
+
+        Dropping the whole exchange meant "no, not that one" arrived with
+        nothing to refer to — the model had no record of the question it was
+        answering or the half-answer you cut off.
+        """
+        partial = "".join(spoken_so_far).strip()
+        history[:] = history + [
+            {"role": "user", "content": text},
+            {"role": "assistant",
+             "content": (partial + " …[interrupted]") if partial else "…[interrupted]"},
+        ]
+
     for _ in range(cfg["tools"]["max_steps"]):
-        message = respond(pending, tools.specs(), watched, cfg, backend)
+        try:
+            message = respond(pending, tools.specs(), watched, cfg, backend)
+        except brain.ResponseInterrupted:
+            # The usual path: cancellation is noticed inside the streaming loop
+            # and raised from the seam, not at a checkpoint here. Record what was
+            # actually said before letting it go.
+            remember_interrupted()
+            raise
         # A streamed model can finish a token or tool-call event just as the
         # user begins speaking. Never let that stale turn run a tool after an
-        # interruption; its local `pending` history is simply discarded.
+        # interruption.
         if cancelled and cancelled():
+            remember_interrupted()
             raise brain.ResponseInterrupted()
         said.clear()
         pending = pending + [message]
@@ -89,6 +122,7 @@ def turn(respond, history, text, on_delta, on_tool, confirm, cfg=CONFIG, on_rout
 
         for call in calls:
             if cancelled and cancelled():
+                remember_interrupted()
                 raise brain.ResponseInterrupted()
             name = call["function"]["name"]
             arguments = call["function"].get("arguments") or {}
@@ -178,6 +212,7 @@ def ask_terminal(summary):
 def main():
     if problem := brain.check():
         sys.exit(problem)
+    check_fence()
 
     import heartbeat
     heartbeat.deliver_pending()
@@ -203,13 +238,10 @@ def main():
         if handle_command(text):
             continue
 
-        if corrections.looks_like_correction(text):
-            if ready := corrections.note(text):
-                print(f"  ↺ you've said that {ready['times']}x — I can remember it "
-                      f"for good if you ask me to\n")
-
-        if instant := reflex.handle(text):
+        if instant := before_turn(text, lambda note: print(f"  ↺ {note}\n")):
             print(f"{NAME} › {instant}\n")
+            history.append({"role": "user", "content": text})
+            history.append({"role": "assistant", "content": instant})
             continue
 
         print(f"{NAME} › ", end="", flush=True)
@@ -243,6 +275,7 @@ def voice_main():
 
     if problem := brain.check():
         sys.exit(problem)
+    check_fence()
 
     import heartbeat
 
@@ -312,6 +345,17 @@ def voice_main():
             print(piece, end="", flush=True)
             speaker.feed(piece)
 
+        if instant := before_turn(heard, lambda note: print(f"  ↺ {note}"),
+                                  speak=lambda said: speaker.say_now(said)):
+            print(f"{NAME} › {instant}\n")
+            speaker.reset_timing()
+            speaker.say_now(instant)
+            speaker.wait()
+            history.append({"role": "user", "content": heard})
+            history.append({"role": "assistant", "content": instant})
+            live.set_phase("idle")
+            continue
+
         try:
             turn(
                 brain.respond,
@@ -327,6 +371,7 @@ def voice_main():
             speaker.wait()
             live.set_phase("idle")
             print("\n")
+            announce_finished(history)
         except Exception as exc:
             speaker.stop()
             print(f"\n[couldn't reach the brain: {exc}]\n")
@@ -457,14 +502,7 @@ def wake_main():
         print("Loading the speech model (once — everything after this is fast)…")
         print("  ready." if ears.start_server() else "  falling back to per-chunk loading.")
 
-    import privacy
-
-    if CONFIG["privacy"]["sandbox_subprocesses"] and not privacy.sandbox_works():
-        print("  ⚠︎  the privacy sandbox could not be verified — screen and web")
-        print("      tools are disabled for this session.")
-        rails.log("PRIVACY", "sandbox unverified — reaching tools disabled")
-        for name in ("look_at_screen", "search_web"):
-            tools.REGISTRY.pop(name, None)
+    check_fence()
 
     speaker = mouth.Speaker()
     mic = ears.StreamMic(prompt=phrase)
@@ -546,33 +584,34 @@ def wake_main():
             live.set_phase("idle")
         return True
 
+    def spoke(text):
+        """Say something outside a turn AND remember having said it.
+
+        A question asked out loud that never entered history — "want me to
+        remember that for good?" — meant the user's answer landed on a model
+        that had no idea anything had been asked.
+        """
+        speaker.say_now(text)
+        history.append({"role": "assistant", "content": text})
+
     def pending_notices():
         """Say anything the heartbeat is holding, while the mic is live."""
         if speaker.is_busy() or rails.is_paused():
             return False
         import heartbeat
 
-        delivered = heartbeat.deliver_pending(speaker.say_now)
+        delivered = heartbeat.deliver_pending(spoke)
         if delivered:
             speaker.wait()
             mic.flush()
         return bool(delivered)
 
-    # The gate runs on the MAIN thread, never the worker — it owns the mic, and
-    # a worker blocked on input() while you answer out loud deadlocks.
-    gate = {"summary": None, "allowed": False}
-    gate_asked, gate_answered = threading.Event(), threading.Event()
+    # The gate is settled on the MAIN thread, never the worker — it owns the
+    # mic, and a worker blocked on input() while you answer out loud deadlocks.
+    gate = Gate(settings["confirm_timeout"] + 15)
 
-    def confirm_aloud(summary):
-        gate["summary"] = summary
-        gate_answered.clear()
-        gate_asked.set()
-        if not gate_answered.wait(timeout=settings["confirm_timeout"] + 15):
-            return False   # nobody answered; never assume permission
-        return gate["allowed"]
-
-    def settle_gate():
-        summary = gate["summary"]
+    def settle_gate(request):
+        request_id, summary = request
         print(f"\n  ⚠︎  {NAME} wants to: {summary}")
         speaker.stop()
         speaker.say_now(_spoken_gate(summary))
@@ -593,29 +632,28 @@ def wake_main():
             speaker.wait()
             mic.flush()
 
+        if not gate.settle(request_id, allowed):
+            allowed = False          # its turn was interrupted while we asked
         print(f"      {'allowed' if allowed else 'denied'} by voice\n")
         if not allowed:
-            speaker.say_now("Alright, I won't.")
-        gate["allowed"] = allowed
-        gate_answered.set()
+            spoke("Alright, I won't.")
 
     def answer(said):
         """Answer one turn while staying open to being talked over."""
         print(f"you › {said}")
 
-        if corrections.looks_like_correction(said):
-            if ready := corrections.note(said):
-                corrections.mark_offered(ready["key"])
-                speaker.say_now(
-                    "You've told me that more than once. Want me to remember it for good?"
-                )
-
-        # Deterministic commands never reach the model. Timers speak for
-        # themselves when they fire, through the same voice.
-        if instant := reflex.handle(said, on_fire=lambda text: speaker.say_now(text)):
+        # Deterministic commands never reach the model, and corrections are
+        # noticed, through the one shared path every front end uses.
+        if instant := before_turn(
+            said,
+            lambda note: spoke(f"You've told me more than once: {said!r}. "
+                               "Want me to remember that for good?"),
+            speak=spoke,
+        ):
             print(f"{NAME} › {instant}\n")
+            history.append({"role": "user", "content": said})
             speaker.reset_timing()
-            speaker.say_now(instant)
+            spoke(instant)
             speaker.wait()
             mic.flush()
             return ""
@@ -623,7 +661,7 @@ def wake_main():
         # The big brain takes about two seconds. Say something rather than
         # leaving a silence that reads as a failure.
         if brain.wants_deep(said):
-            speaker.say_now(CONFIG["deep"]["acknowledgement"])
+            spoke(CONFIG["deep"]["acknowledgement"])
 
         print(f"{NAME} › ", end="", flush=True)
         speaker.reset_timing()
@@ -646,7 +684,7 @@ def wake_main():
                 turn(streaming_response, history, said,
                      on_delta=on_delta,
                      on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
-                     confirm=confirm_aloud,
+                     confirm=lambda summary: gate.ask(summary, cancelled=interrupted.is_set),
                      on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
                      backend_override=CONFIG["voice"].get("backend"),
                      cancelled=interrupted.is_set)
@@ -664,10 +702,9 @@ def wake_main():
         if not settings.get("barge_in", False):
             mic.muted = True
             while worker.is_alive():
-                if gate_asked.is_set():
-                    gate_asked.clear()
+                if request := gate.next_request():
                     mic.muted = False
-                    settle_gate()
+                    settle_gate(request)
                     mic.muted = True
                 worker.join(timeout=0.2)
             speaker.wait()
@@ -676,9 +713,8 @@ def wake_main():
         else:
             minimum = settings.get("barge_in_min_words", 2)
             while worker.is_alive() or speaker.is_busy():
-                if gate_asked.is_set():
-                    gate_asked.clear()
-                    settle_gate()
+                if request := gate.next_request():
+                    settle_gate(request)
                     continue
                 mic.duck_db = settings["barge_in_duck_db"] if speaker.is_busy() else 0.0
                 heard = listen(time.time() + 0.4, timed=False)
@@ -692,6 +728,7 @@ def wake_main():
                     continue
                 mic.duck_db = 0.0
                 interrupted.set()
+                gate.revoke_all()       # a yes for the old turn must not survive
                 speaker.stop()
                 worker.join(timeout=2)
                 print("\n  ↳ interrupted")
@@ -819,13 +856,18 @@ def misses_main():
 
 # Long dictation is exactly where mishearing costs the most, and where you are
 # least able to check — so it gets read back before anything is written.
-CONTENT = __import__("re").compile(r"(?:text|fact|title|question)='([^']*)'")
+# Both quote styles: repr() switches to double quotes the moment the text
+# contains an apostrophe, and "my mother's name change document" is precisely
+# the sort of sentence this exists to read back.
+CONTENT = __import__("re").compile(
+    r"""(?:text|fact|title|question|body|subject)=(?:'([^']*)'|"([^"]*)")"""
+)
 
 
 def _spoken_gate(summary):
     action = summary.split("(")[0].replace("_", " ")
     found = CONTENT.search(summary)
-    content = found.group(1) if found else ""
+    content = (found.group(1) or found.group(2)) if found else ""
     if content and len(content.split()) >= CONFIG["wake"]["repeat_back_words"]:
         return f"I heard: {content}. Shall I {action}? Say yes or no."
     if content:
@@ -857,6 +899,103 @@ def report_stages(marks, speaker):
     print(f"        {'total, heard-to-heard':<30} {total:7.0f} ms   "
           f"(target {budget['total_ms']})")
     rails.log("LATENCY", f"{total:.0f}ms total")
+
+
+class Gate:
+    """A spoken confirmation, handed from the worker to the main thread.
+
+    It used to be one shared dict and one pair of events for the whole session.
+    A barge-in abandoned the worker still waiting on it, and the *next* turn's
+    "yes" set the same event — so a yes meant for one action could wake a
+    worker from an earlier, interrupted turn and authorise its tool instead.
+
+    Now every request has its own id and its own answer slot. An answer only
+    reaches the request it was given for, an interrupt revokes everything
+    outstanding, and a request whose turn was cancelled is refused whatever it
+    was told.
+    """
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._next = 0
+        self._waiting = None        # (id, summary) not yet put to the user
+        self._slots = {}            # id -> [answered Event, allowed]
+
+    def ask(self, summary, cancelled=None):
+        """Worker side. Blocks until answered, refused, revoked or timed out."""
+        with self._lock:
+            self._next += 1
+            request = self._next
+            slot = [threading.Event(), False]
+            self._slots[request] = slot
+            self._waiting = (request, summary)
+        answered = slot[0].wait(self.timeout)
+        with self._lock:
+            self._slots.pop(request, None)
+        if not answered or (cancelled and cancelled()):
+            return False            # silence, or the turn it belonged to is gone
+        return slot[1]
+
+    def next_request(self):
+        """Main-thread side: the request to put to the user, once, or None."""
+        with self._lock:
+            request, self._waiting = self._waiting, None
+            return request
+
+    def settle(self, request, allowed):
+        """Answer one specific request. False if it no longer exists."""
+        with self._lock:
+            slot = self._slots.get(request)
+            if slot is None:
+                return False
+            slot[1] = bool(allowed)
+            slot[0].set()
+            return True
+
+    def revoke_all(self):
+        """An interruption: nothing that was waiting may go ahead."""
+        with self._lock:
+            for slot in self._slots.values():
+                slot[1] = False
+                slot[0].set()
+            self._waiting = None
+
+
+def before_turn(text, on_note, speak=None):
+    """What every front end must do before the model sees a turn.
+
+    Three front ends each hand-rolled this and voice_main quietly fell behind —
+    it never learned a correction, never answered a timer, never mentioned
+    finished background work. One function, so drift is not possible.
+
+    Returns a reply if the turn was answered without the model, else None.
+    """
+    if corrections.looks_like_correction(text):
+        if ready := corrections.note(text):
+            corrections.mark_offered(ready["key"])
+            on_note(f"you've said that {ready['times']}x — I can remember it for good")
+
+    return reflex.handle(text, on_fire=speak)
+
+
+def check_fence():
+    """Prove the privacy boundary before any mode that can reach outside.
+
+    This lived inside wake_main, so typing at it — the mode the README calls the
+    best way to debug — trusted the sandbox without ever testing it. An
+    unprovable fence removes the reaching tools rather than hoping.
+    """
+    import privacy
+
+    if not CONFIG["privacy"]["sandbox_subprocesses"] or privacy.sandbox_works():
+        return True
+    print("  ⚠︎  the privacy sandbox could not be verified — screen and web")
+    print("      tools are disabled for this session.")
+    rails.log("PRIVACY", "sandbox unverified — reaching tools disabled")
+    for name in ("look_at_screen", "search_web", "read_email"):
+        tools.REGISTRY.pop(name, None)
+    return False
 
 
 def _release():

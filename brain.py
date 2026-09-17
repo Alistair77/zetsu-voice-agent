@@ -99,6 +99,11 @@ def ollama_respond(history, tools, on_delta, cfg=CONFIG, cancelled=None):
         # Keep the model resident. A cold load costs ~6s, which is the difference
         # between a conversation and waiting for a computer.
         "keep_alive": model["keep_alive"],
+        # Without this Ollama uses its own default window (2-4k), not qwen2.5's
+        # 32k — and the system prompt plus twenty tool specs already spend about
+        # 2.5k of it, so a real conversation was being truncated from the front
+        # with no sign that it had happened.
+        "options": {"num_ctx": model["context_tokens"]},
     }
     if tools:
         payload["tools"] = tools

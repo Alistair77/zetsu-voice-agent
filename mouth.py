@@ -67,6 +67,10 @@ class Speaker:
         self.echo_seconds = cfg["voice"].get("echo_memory_seconds", 20)
         self.echo_threshold = cfg["voice"].get("echo_threshold", 0.45)
         self.first_audio = None   # when sound actually reached the speakers
+        # Bumped by stop(). Work carrying a stale epoch is dropped rather than
+        # spoken — emptying the queues alone left whatever was mid-synthesis
+        # to arrive a moment later, after you had already interrupted.
+        self.epoch = 0
         # What was actually played, and when. This is the reference signal for
         # echo cancellation: the microphone is about to hear this back, and
         # knowing exactly what it will hear is what makes it removable.
@@ -164,9 +168,14 @@ class Speaker:
                 if text is None:
                     self.audio.put(None)
                     return
+                mine = self.epoch
                 self.remember_saying(text)
                 path = self._synthesise(text)
-                self.audio.put((path, text))
+                if mine != self.epoch:
+                    if path:
+                        path.unlink(missing_ok=True)
+                    continue          # interrupted while this was being made
+                self.audio.put((mine, path, text))
             except Exception:
                 pass  # a dead voice must never take the conversation down
             finally:
@@ -178,7 +187,11 @@ class Speaker:
             try:
                 if item is None:
                     return
-                path, text = item
+                mine, path, text = item
+                if mine != self.epoch:
+                    if path:
+                        path.unlink(missing_ok=True)
+                    continue          # queued before an interrupt; do not speak it
                 if self.first_audio is None:
                     self.first_audio = time.time()
                 self._play(path, text)
@@ -306,11 +319,12 @@ class Speaker:
         The wake loop asks this before every capture. Without it the open mic
         hears Zetsu say its own name and answers itself, forever.
         """
+        # Ask the process, not the attribute. The `say` fallback assigned
+        # self.current and never cleared it, so is_busy() stayed true forever
+        # and the open-mic loop waited on a speaker that had long finished.
+        playing = self.current is not None and self.current.poll() is None
         return bool(
-            self.buffer
-            or not self.queue.empty()
-            or not self.audio.empty()
-            or self.current is not None
+            self.buffer or not self.queue.empty() or not self.audio.empty() or playing
         )
 
     def close(self):
@@ -330,14 +344,16 @@ class Speaker:
         self.workspace.cleanup()
 
     def stop(self):
+        """Silence, including whatever is between the two workers right now."""
         """Shut up immediately. The user starting a new turn always wins."""
+        self.epoch += 1          # everything already in flight is now stale
         self.buffer = ""
         for pending in (self.queue, self.audio):
             while not pending.empty():
                 try:
                     item = pending.get_nowait()
-                    if isinstance(item, tuple) and item[0] is not None:
-                        item[0].unlink(missing_ok=True)
+                    if isinstance(item, tuple) and len(item) == 3 and item[1]:
+                        item[1].unlink(missing_ok=True)
                     pending.task_done()
                 except queue.Empty:
                     break

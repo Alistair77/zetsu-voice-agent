@@ -286,6 +286,7 @@ return output
 @tool(
     "Look at the user's real calendar. Use this whenever they ask what is on, "
     "what they have coming up, whether they are free, or about a meeting.",
+    screen=True,  # text from outside this machine is data, never instruction
     when_opt="'today' or 'tomorrow'. Defaults to today.",
 )
 def whats_on(when="today"):
@@ -324,6 +325,7 @@ def add_calendar_event(title, start, minutes="60"):
 @tool(
     "Read the user's Apple Reminders — the ones that sync to their phone. Use "
     "this when they ask about reminders rather than this program's own todo list.",
+    screen=True,  # text from outside this machine is data, never instruction
 )
 def apple_reminders():
     found = _osascript(
@@ -402,6 +404,7 @@ def _ask_claude(prompt, allowed, seconds=120, workdir=None):
 @tool(
     "Look at what is on the user's screen and answer a question about it. Use "
     "for 'what is this error', 'what am I looking at', 'read this to me'.",
+    screen=True,  # text from outside this machine is data, never instruction
     slow=12,
     question="What they want to know about what is on screen.",
 )
@@ -430,6 +433,7 @@ def look_at_screen(question):
 @tool(
     "Search the web for current information. Use for news, prices, today's "
     "facts, or anything you might be out of date on. Not for things you know.",
+    screen=True,  # text from outside this machine is data, never instruction
     slow=18,
     query="What to search for, as a plain question.",
 )
@@ -444,6 +448,7 @@ def search_web(query):
 @tool(
     "Read the most recent emails in the user's inbox — senders and subjects. "
     "Use when they ask what has come in or whether anything needs them.",
+    screen=True,  # text from outside this machine is data, never instruction
     slow=6,
     count_opt="How many to look at. Defaults to 5.",
 )
@@ -541,9 +546,19 @@ def run(name, arguments, confirmer):
     # only marked results are the ones that must not be mistaken for success.
     if entry["slow"] >= CONFIG["jobs"]["background_over_seconds"]:
         label = name.replace("_", " ")
-        job_id, estimate = jobs.start(
-            label, lambda: str(entry["function"](**arguments)), entry["slow"]
-        )
+
+        def work():
+            # Screened inside the job, because the early return below meant a
+            # background result — a web page, an inbox, a screenshot — reached
+            # the model having bypassed screening entirely.
+            produced = str(entry["function"](**arguments))
+            if entry["screen"]:
+                produced, caught = rails.screen(produced, name)
+                if caught:
+                    print(f"\n  !!  content from {name} tried to give an instruction: {caught!r}")
+            return produced
+
+        job_id, estimate = jobs.start(label, work, entry["slow"])
         return (f"{label} is now running in the background, about "
                 f"{estimate}s. Tell the user roughly how long and that you will "
                 f"come back with it. Do not invent the answer — you do not have it "
