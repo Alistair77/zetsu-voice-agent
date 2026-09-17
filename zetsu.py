@@ -199,8 +199,15 @@ def handle_command(text):
 
 # --- terminal front end ------------------------------------------------------
 
-def ask_terminal(summary):
-    """The confirmation gate, terminal edition. Tier 6 hardens this."""
+def ask_terminal(summary, speak=None):
+    """The confirmation gate at a keyboard, spoken too when a voice is present.
+
+    Push-to-talk had its own copy that announced only the action — "I want to
+    add todo" — and never read back what was about to be saved. The repeat-back
+    fix only ever reached the open-mic mode. One function, so both get it.
+    """
+    if speak:
+        speak(_spoken_gate(summary, answer_by="Type yes or no."))
     print(f"\n  ⚠︎  {NAME} wants to: {summary}")
     try:
         answer = input("      allow? [y/N] ").strip().lower()
@@ -212,9 +219,7 @@ def ask_terminal(summary):
 
 
 def main():
-    if problem := brain.check():
-        sys.exit(problem)
-    check_fence()
+    _start()
 
     import heartbeat
     heartbeat.deliver_pending()
@@ -256,7 +261,7 @@ def main():
                 history,
                 text,
                 on_delta=lambda piece: print(piece, end="", flush=True),
-                on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
+                on_tool=_tool_line,
                 confirm=ask_terminal,
                 on_route=lambda backend, why: print(f"[{backend}: {why}]  ", end="", flush=True),
             )
@@ -264,7 +269,7 @@ def main():
             print("\n")
             announce_finished(history)
         except Exception as exc:  # backend down, timeout, bad model — never crash out
-            print(f"\n[couldn't reach the brain: {exc}]\n")
+            _brain_unreachable(exc)
 
     _release()
     print(f"{NAME} out.")
@@ -278,28 +283,13 @@ def voice_main():
     import ears
     import mouth
 
-    if problem := brain.check():
-        sys.exit(problem)
-    check_fence()
+    _start()
 
     import heartbeat
 
     speaker = mouth.Speaker()
     heartbeat.deliver_pending(speaker.say_now)
     history = []
-
-    def confirm_aloud(summary):
-        """The gate has to be audible — in voice mode your eyes may be elsewhere."""
-        speaker.stop()
-        speaker.say_now(f"I want to {summary.split('(')[0].replace('_', ' ')}. Is that okay?")
-        print(f"\n  ⚠︎  {NAME} wants to: {summary}")
-        try:
-            answer = input("      allow? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-        print()
-        return answer in ("y", "yes")
 
     print(f"{NAME} is here. Enter to talk, Enter again to stop. /quit to leave.\n")
     while True:
@@ -370,8 +360,9 @@ def voice_main():
                 history,
                 heard,
                 on_delta=on_delta,
-                on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
-                confirm=confirm_aloud,
+                on_tool=_tool_line,
+                confirm=lambda summary: ask_terminal(
+                    summary, speak=lambda text: (speaker.stop(), speaker.say_now(text))),
                 cfg=brain.spoken(),
                 backend_override=CONFIG["voice"].get("backend"),
             )
@@ -383,7 +374,7 @@ def voice_main():
             announce_finished(history)
         except Exception as exc:
             speaker.stop()
-            print(f"\n[couldn't reach the brain: {exc}]\n")
+            _brain_unreachable(exc)
 
     speaker.close()
     _release()
@@ -474,7 +465,6 @@ def _save_variants(variants):
     """Rewrite just the variants line in config.toml, leaving the rest alone."""
     import re
 
-    path = brain.ROOT / "config.toml" if hasattr(brain, "ROOT") else None
     from config import ROOT as _root
 
     path = _root / "config.toml"
@@ -500,8 +490,7 @@ class VoiceLoop:
     """
 
     def __init__(self):
-        if problem := brain.check():
-            sys.exit(problem)
+        _start()
 
         self.settings = CONFIG["wake"]
         self.phrase = self.settings["phrase"]
@@ -509,8 +498,6 @@ class VoiceLoop:
         if CONFIG["voice"]["use_server"]:
             print("Loading the speech model (once — everything after this is fast)…")
             print("  ready." if ears.start_server() else "  falling back to per-chunk loading.")
-
-        check_fence()
 
         self.speaker = mouth.Speaker()
         self.mic = ears.StreamMic(prompt=self.phrase)
@@ -694,7 +681,7 @@ class VoiceLoop:
             try:
                 turn(streaming_response, self.history, said,
                      on_delta=on_delta,
-                     on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
+                     on_tool=_tool_line,
                      confirm=lambda summary: self.gate.ask(summary, cancelled=interrupted.is_set),
                      cfg=brain.spoken(),
                      on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
@@ -762,7 +749,7 @@ class VoiceLoop:
 
         if outcome["error"]:
             self.speaker.stop()
-            print(f"\n[couldn't reach the brain: {outcome['error']}]\n")
+            _brain_unreachable(outcome["error"])
             return ""
         print("\n")
         self.speaker.wait()
@@ -893,15 +880,15 @@ CONTENT = __import__("re").compile(
 )
 
 
-def _spoken_gate(summary):
+def _spoken_gate(summary, answer_by="Say yes or no."):
     action = summary.split("(")[0].replace("_", " ")
     found = CONTENT.search(summary)
     content = (found.group(1) or found.group(2)) if found else ""
     if content and len(content.split()) >= CONFIG["wake"]["repeat_back_words"]:
-        return f"I heard: {content}. Shall I {action}? Say yes or no."
+        return f"I heard: {content}. Shall I {action}? {answer_by}"
     if content:
-        return f"I want to {action}: {content}. Say yes or no."
-    return f"I want to {action}. Say yes or no."
+        return f"I want to {action}: {content}. {answer_by}"
+    return f"I want to {action}. {answer_by}"
 
 
 def report_stages(marks, speaker):
@@ -1010,6 +997,22 @@ def before_turn(text, on_note, speak=None):
             on_note(f"you've said that {ready['times']}x — I can remember it for good")
 
     return reflex.split(text, on_fire=speak)
+
+
+def _start():
+    """How every front end begins. The privacy fence was once proven by exactly
+    one mode of three; starting in one place is what keeps that from recurring."""
+    if problem := brain.check():
+        sys.exit(problem)
+    check_fence()
+
+
+def _tool_line(name, arguments):
+    print(f"\n  · {name}({_short(arguments)})")
+
+
+def _brain_unreachable(exc):
+    _brain_unreachable(exc)
 
 
 def check_fence():

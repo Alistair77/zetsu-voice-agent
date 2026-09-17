@@ -380,8 +380,20 @@ def _():
         privacy.sandbox_works = real_works
         tools.REGISTRY.clear()
         tools.REGISTRY.update(saved)
+    # Behavioural, not a text search: actually start up, once, and prove the
+    # fence was checked exactly once. A text search passed happily while
+    # _start() called itself forever — every mode would have crashed on launch.
+    import brain as _brain
+
+    calls, real_check, real_fence = [], _brain.check, zetsu.check_fence
+    _brain.check, zetsu.check_fence = (lambda: None), (lambda: calls.append(1))
+    try:
+        zetsu._start()
+    finally:
+        _brain.check, zetsu.check_fence = real_check, real_fence
+    assert calls == [1], f"startup checked the fence {len(calls)} times"
     for name in ("main", "voice_main", "VoiceLoop"):
-        assert "check_fence()" in source_of(getattr(zetsu, name)), f"{name} skips the fence"
+        assert "_start()" in source_of(getattr(zetsu, name)), f"{name} skips the shared startup"
 
 
 @check(26, "being interrupted keeps the question and what had been said")

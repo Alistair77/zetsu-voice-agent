@@ -30,11 +30,6 @@ from config import CONFIG, ROOT, STATE
 NOTICES = STATE / "notices.json"
 
 
-def load_config():
-    """Re-read config.toml fresh, so the kill switch works without a restart."""
-    return tomllib.loads((ROOT / "config.toml").read_text())
-
-
 def _minutes(hhmm):
     hour, minute = hhmm.split(":")
     return int(hour) * 60 + int(minute)
@@ -110,7 +105,7 @@ def deliver_pending(speak=None):
 def tick(now=None, speak=None, cfg=None):
     """One heartbeat: look for new things to say, then say them — unless it's
     quiet hours, in which case they sit in the pending store untouched."""
-    cfg = cfg or load_config()
+    cfg = cfg or rails.fresh_config()
     if rails.is_paused(cfg):
         return
     now = now or datetime.now()
@@ -123,7 +118,7 @@ def run_loop(speak=None):
     print("heartbeat running. Ctrl-C to stop.")
     try:
         while True:
-            cfg = load_config()
+            cfg = rails.fresh_config()
             tick(speak=speak, cfg=cfg)
             time.sleep(cfg["heartbeat"]["interval_seconds"])
     except KeyboardInterrupt:

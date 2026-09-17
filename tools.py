@@ -35,7 +35,8 @@ UNTRUSTED = (
 def tool(description, confirm=False, screen=False, slow=0, **params):
     """Register a function as a tool. `params` maps name -> description string.
 
-    A name ending in '?' is optional; everything else is required.
+    A name ending in `_opt` is optional, and the suffix is stripped from the
+    argument's name. Everything else is required.
     """
 
     def register(function):
@@ -539,9 +540,6 @@ def run(name, arguments, confirmer):
     else:
         rails.log("RAN", summary)
 
-    # Whether an action worked is decided here, by what actually happened — never
-    # by the model reading a hopeful-sounding string. Every result is stamped, and
-    # the system prompt forbids claiming success without an [OK].
     # No decorated prefix on success. A small model copies whatever distinctive
     # format it is shown — given "[OK]" it starts answering "[OK] 4" — so the
     # only marked results are the ones that must not be mistaken for success.

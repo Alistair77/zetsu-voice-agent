@@ -60,25 +60,3 @@ def collect():
         ready = [_jobs[i] for i in _finished]
         _finished.clear()
     return ready
-
-
-def describe_running():
-    live = running()
-    if not live:
-        return ""
-    parts = []
-    for job in live:
-        left = max(0, job["estimate"] - (time.time() - job["started"]))
-        parts.append(f"{job['label']} (about {left:.0f}s left)" if left > 1
-                     else f"{job['label']} (any moment)")
-    return "Still working on: " + "; ".join(parts)
-
-
-def phrase_wait(label, seconds):
-    """How to tell someone this will take a moment, without sounding like a form."""
-    if seconds <= 5:
-        return f"Give me a few seconds on {label}."
-    if seconds <= 15:
-        return f"That'll take me about {int(seconds)} seconds — I'll come back to you on it."
-    return (f"That one takes a while, maybe {int(seconds)} seconds. "
-            "I'll carry on and tell you when it's done.")

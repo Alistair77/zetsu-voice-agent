@@ -54,10 +54,6 @@ def allow(path, why=""):
     return True
 
 
-def keep_allowed(paths, why=""):
-    return [p for p in paths if allow(p, why)]
-
-
 def safe_roots(roots):
     """Drop any configured search root that overlaps forbidden ground."""
     return [r for r in roots if not is_off_limits(r)]
