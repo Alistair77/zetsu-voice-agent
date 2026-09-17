@@ -252,9 +252,8 @@ class Recording:
         self.wav = Path(self.workspace.name) / "turn.wav"
         self.process = start_recording(self.wav)
         self.level = -99.0
-        self.tail_level = -99.0
 
-    def finish(self, prompt=None, quiet_below=None):
+    def finish(self, prompt=None):
         """Stop recording and return what was said ("" if nothing was)."""
         try:
             stop_recording(self.process)
@@ -264,11 +263,6 @@ class Recording:
                     "in System Settings > Privacy & Security > Microphone."
                 )
             self.level = level_dbfs(self.wav)
-            self.tail_level = level_dbfs(self.wav, CONFIG["voice"]["vad_tail_ms"])
-            if quiet_below is not None and self.level < quiet_below:
-                # Nothing was said. Whisper on silence costs time and invents
-                # words; skipping it is faster *and* more accurate.
-                return ""
             return transcribe(self.wav, prompt)
         finally:
             self.workspace.cleanup()
@@ -516,82 +510,6 @@ class StreamMic:
                 self.process.kill()
 
 
-class OpenMic:
-    """Gapless chunked listening.
-
-    The naive loop — record, transcribe, record, transcribe — is deaf for the
-    second or so whisper spends thinking, and that is exactly when the start of
-    your sentence goes missing. So the next capture is started *before* the last
-    one is transcribed: there is always a recorder running.
-    """
-
-    def __init__(self, seconds, prompt=None, overlap=None):
-        self.seconds = seconds
-        self.prompt = prompt
-        self.overlap = CONFIG["wake"]["chunk_overlap_seconds"] if overlap is None else overlap
-        self.current = Recording()
-        # Learned from the room rather than assumed. A fixed threshold is right
-        # until a fan comes on, and then it is wrong for the rest of the day.
-        self.noise_floor = CONFIG["voice"]["vad_silence_dbfs"] - CONFIG["voice"]["vad_margin_db"]
-        self.level = -99.0
-        self.tail_level = -99.0
-
-    def silence_threshold(self):
-        return self.noise_floor + CONFIG["voice"]["vad_margin_db"]
-
-    def tail_is_quiet(self):
-        """True if this slice ended in silence — i.e. the speaker has stopped."""
-        return self.tail_level < self.silence_threshold()
-
-    def _learn_floor(self, level):
-        if level <= -99.0:
-            return
-        if level < self.noise_floor:
-            self.noise_floor = self.noise_floor * 0.7 + level * 0.3   # drops fast
-        elif level < self.silence_threshold():
-            self.noise_floor = self.noise_floor * 0.98 + level * 0.02  # creeps up
-
-    def next_chunk(self, seconds=None):
-        """One slice. `seconds` overrides the default for this slice only.
-
-        Asleep, a slice must be long enough to hold the whole wake word.
-        Awake, it must be short enough that an interruption registers quickly.
-        Same rolling recorder either way — only the length changes.
-        """
-        window = self.seconds if seconds is None else seconds
-        overlap = min(self.overlap, window * 0.5)
-
-        # Start the next recorder BEFORE this window closes, so consecutive
-        # slices share `overlap` seconds of audio. Without it a wake word can
-        # land across the join and be chopped in half — "Friday" arrives as
-        # "Day" and nothing wakes. With it, a split word is still whole in one
-        # of the two slices.
-        time.sleep(max(0.05, window - overlap))
-        following = Recording()
-        time.sleep(overlap)
-        try:
-            text = self.current.finish(
-                self.prompt,
-                quiet_below=self.silence_threshold()
-                if CONFIG["voice"]["vad_skip_silent"]
-                else None,
-            )
-            self.level = self.current.level
-            self.tail_level = self.current.tail_level
-            self._learn_floor(self.level)
-            return text
-        finally:
-            self.current = following
-
-    def close(self):
-        """Stop listening — used while Zetsu is talking, so it can't hear itself."""
-        try:
-            self.current.finish()
-        except Exception:
-            pass
-        self.current = None
-
-
 def normalise(text):
     """Lowercase, strip punctuation, collapse whitespace. Matching and
     calibration must agree exactly, so they share this one function."""
@@ -646,33 +564,6 @@ def matches_any(text, phrases):
     return any(phrase in cleaned for phrase in phrases)
 
 
-def stitch(parts):
-    """Join overlapping slices without repeating the words they share.
-
-    Consecutive slices deliberately share audio, so the same words are
-    transcribed twice. Left alone the question arrives as "what is on my todo
-    list model list". Trim the longest run of words that ends one slice and
-    starts the next.
-    """
-    merged = []
-    for part in parts:
-        words = part.split()
-        if not words:
-            continue
-        if not merged:
-            merged = words
-            continue
-        longest = min(len(merged), len(words), 8)
-        for size in range(longest, 0, -1):
-            tail = [w.lower().strip(".,?!") for w in merged[-size:]]
-            head = [w.lower().strip(".,?!") for w in words[:size]]
-            if tail == head:
-                words = words[size:]
-                break
-        merged += words
-    return " ".join(merged)
-
-
 def best_near_miss(text, cfg=CONFIG):
     """The closest thing to the wake word in `text`, and how close it got.
 
@@ -717,3 +608,14 @@ def sounds_unfinished(text):
     if not words:
         return False
     return words[-1] in DANGLING
+
+
+def says_only(text, phrases, max_words):
+    """True if `text` is essentially just one of `phrases`, not a sentence containing it.
+
+    Goodbyes were matched as substrings, so "I'm finished with the draft, what's
+    next?" ended the conversation and threw the question away. A goodbye is a
+    short utterance; a sentence that happens to contain one is not.
+    """
+    cleaned = normalise(text)
+    return len(cleaned.split()) <= max_words and any(p in cleaned for p in phrases)

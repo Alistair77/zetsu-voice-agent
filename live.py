@@ -57,12 +57,23 @@ def remember_duration(backend, seconds):
 # A pidfile rather than a handle, so the dashboard can see a mic loop it did not
 # start itself — you might have run it from a terminal.
 
-def claim_mic():
+def claim_mic(pid=None):
+    """Record who holds the microphone. A parent may claim on its child's behalf."""
     STATE.mkdir(exist_ok=True)
-    PID.write_text(str(os.getpid()))
+    PID.write_text(str(pid or os.getpid()))
 
 
 def release_mic():
+    """Give up the claim — but only our own.
+
+    Unlinking unconditionally let one process delete a claim that belonged to
+    another, which is how two open-mic loops ended up believing each was alone.
+    """
+    try:
+        if int(PID.read_text().strip()) != os.getpid():
+            return
+    except (FileNotFoundError, ValueError):
+        return
     PID.unlink(missing_ok=True)
 
 

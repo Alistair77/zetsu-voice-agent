@@ -97,8 +97,6 @@ transcribe_timeout = 60
 # something has to be to count as you talking.
 vad_silence_dbfs = -48
 vad_margin_db = 8
-vad_tail_ms = 350        # how much of a slice's end must be quiet to call it over
-vad_skip_silent = true   # do not run whisper on a slice that is clearly silence
 
 use_server = true
 server_port = 8770
@@ -175,15 +173,9 @@ variants = ["friday", "fry day", "freeday", "free day", "fridays", "friday s"]
 # also on things you did not say. Raise it if it starts triggering on its own.
 similarity = 0.78
 takes = 3                # how many samples `--calibrate` records
-# Asleep: long enough to hold the whole wake word in one slice. Latency does
-# not matter here, reliability does — a chopped "Friday" is heard as "Day".
-chunk_seconds = 2.5
 # Awake: short slices so an interruption registers fast. Reliability matters
 # less now, because you are mid-conversation and it collects across slices.
-awake_chunk_seconds = 1.2
-# Consecutive slices share this much audio, so a word spoken across the join is
-# still complete in one of them. Costs a little CPU, buys reliable waking.
-chunk_overlap_seconds = 0.7
+question_wait_seconds = 1.2   # after a bare wake word, how long to wait for the question
 show_chunks = false     # print every slice it hears — turn on when the mic misbehaves
 command_seconds = 6      # how long you get to speak after it wakes
 
@@ -222,6 +214,17 @@ follow_up_seconds = 12
 # Say any of these and it stays awake indefinitely — for a long conversation.
 stay_awake = ["long conversation", "lets talk", "lets chat", "keep listening",
               "stay awake", "stay with me", "dont go to sleep", "keep the mic on"]
+
+# Only counts when that is roughly all you said — "I'm finished with the draft,
+# what's next?" is a question, not a goodbye.
+goodbye_max_words = 6
+
+# Stops it mid-sentence, however short. Interrupting normally needs several words
+# while it is talking (its own echo comes back as short fragments), but the one
+# thing you most need to be able to say mid-reply is "wait".
+abort_words = ["stop", "wait", "hold on", "never mind", "nevermind", "cancel that",
+               "not that", "shut up", "be quiet", "enough", "forget it"]
+abort_max_words = 4
 
 # Say any of these and it goes back to sleep until the wake word.
 goodbyes = ["bye bye", "goodbye", "im done for the day", "im done for today",

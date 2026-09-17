@@ -20,8 +20,10 @@ import time
 
 import brain
 import corrections
+import ears
 import jobs
 import live
+import mouth
 import rails
 import reflex
 import tools
@@ -238,11 +240,14 @@ def main():
         if handle_command(text):
             continue
 
-        if instant := before_turn(text, lambda note: print(f"  ↺ {note}\n")):
+        instant, rest = before_turn(text, lambda note: print(f"  ↺ {note}\n"))
+        if instant:
             print(f"{NAME} › {instant}\n")
             history.append({"role": "user", "content": text})
             history.append({"role": "assistant", "content": instant})
+        if not rest:
             continue
+        text = rest
 
         print(f"{NAME} › ", end="", flush=True)
         try:
@@ -345,16 +350,19 @@ def voice_main():
             print(piece, end="", flush=True)
             speaker.feed(piece)
 
-        if instant := before_turn(heard, lambda note: print(f"  ↺ {note}"),
-                                  speak=lambda said: speaker.say_now(said)):
+        instant, rest = before_turn(heard, lambda note: print(f"  ↺ {note}"),
+                                    speak=lambda said: speaker.say_now(said))
+        if instant:
             print(f"{NAME} › {instant}\n")
             speaker.reset_timing()
             speaker.say_now(instant)
             speaker.wait()
             history.append({"role": "user", "content": heard})
             history.append({"role": "assistant", "content": instant})
+        if not rest:
             live.set_phase("idle")
             continue
+        heard = rest
 
         try:
             turn(
@@ -364,6 +372,7 @@ def voice_main():
                 on_delta=on_delta,
                 on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
                 confirm=confirm_aloud,
+                cfg=brain.spoken(),
                 backend_override=CONFIG["voice"].get("backend"),
             )
             live.set_phase("speaking")
@@ -481,7 +490,7 @@ def _save_variants(variants):
 # ears, same brain, same gate. Two things this needs that push-to-talk did not —
 # it must never hear itself, and the wake word can land across a chunk boundary.
 
-def wake_main():
+class VoiceLoop:
     """Open mic, continuous. No slices, no device handover.
 
     One audio stream runs for the whole session and frames are measured as they
@@ -489,36 +498,38 @@ def wake_main():
     closes. That was worth 2865ms down to roughly 650ms — every processing stage
     was already inside budget; the waiting was the cost.
     """
-    import ears
-    import mouth
 
-    if problem := brain.check():
-        sys.exit(problem)
+    def __init__(self):
+        if problem := brain.check():
+            sys.exit(problem)
 
-    settings = CONFIG["wake"]
-    phrase = settings["phrase"]
+        self.settings = CONFIG["wake"]
+        self.phrase = self.settings["phrase"]
 
-    if CONFIG["voice"]["use_server"]:
-        print("Loading the speech model (once — everything after this is fast)…")
-        print("  ready." if ears.start_server() else "  falling back to per-chunk loading.")
+        if CONFIG["voice"]["use_server"]:
+            print("Loading the speech model (once — everything after this is fast)…")
+            print("  ready." if ears.start_server() else "  falling back to per-chunk loading.")
 
-    check_fence()
+        check_fence()
 
-    speaker = mouth.Speaker()
-    mic = ears.StreamMic(prompt=phrase)
-    # Echo cancellation: the microphone can ask the speaker what it just played,
-    # and recognise that audio coming back instead of guessing from loudness.
-    mic.reference = speaker.reference_between
-    history, marks = [], {}
+        self.speaker = mouth.Speaker()
+        self.mic = ears.StreamMic(prompt=self.phrase)
+        # Echo cancellation: the microphone can ask the speaker what it just played,
+        # and recognise that audio coming back instead of guessing from loudness.
+        self.mic.reference = self.speaker.reference_between
+        self.history, self.marks = [], {}
+        # The gate is settled on the MAIN thread, never the worker — it owns the
+        # mic, and a worker blocked on input() while you answer out loud deadlocks.
+        self.gate = Gate(self.settings["confirm_timeout"] + 15)
 
-    def note_timing():
-        if mic.speech_ended:
-            marks["speech_end"] = mic.speech_ended
-            marks["endpoint"] = mic.speech_ended
-        if mic.transcript_at:
-            marks["stt"] = mic.transcript_at
+    def note_timing(self):
+        if self.mic.speech_ended:
+            self.marks["speech_end"] = self.mic.speech_ended
+            self.marks["endpoint"] = self.mic.speech_ended
+        if self.mic.transcript_at:
+            self.marks["stt"] = self.mic.transcript_at
 
-    def listen(deadline=None, timed=True, allow_continuation=True):
+    def listen(self, deadline=None, timed=True, allow_continuation=True):
         """One utterance. Waits longer when the sentence is clearly unfinished.
 
         A fixed silence is the wrong way to decide someone has stopped talking.
@@ -527,7 +538,7 @@ def wake_main():
         word, listen again and join the pieces.
         """
         try:
-            heard = mic.next_utterance(deadline)
+            heard = self.mic.next_utterance(deadline)
         except RuntimeError as exc:
             rails.log("MIC", f"stream fault: {exc}")
             print(f"    ‹mic stream stopped: {exc}›")
@@ -538,9 +549,9 @@ def wake_main():
             for _ in range(CONFIG["stream"]["max_continuations"]):
                 if not ears.sounds_unfinished(heard):
                     break
-                if settings.get("show_chunks"):
+                if self.settings.get("show_chunks"):
                     print(f"    ‹…still going: {heard.split()[-1]!r}›")
-                more = mic.next_utterance(time.time() + grace)
+                more = self.mic.next_utterance(time.time() + grace)
                 if not more:
                     break
                 heard = f"{heard} {more}".strip()
@@ -548,132 +559,132 @@ def wake_main():
         if timed:
             # Barge-in polls must not stamp the marks, or a later listen
             # overwrites the transcript time and the report reads negative.
-            note_timing()
-        if heard and settings.get("show_chunks"):
+            self.note_timing()
+        if heard and self.settings.get("show_chunks"):
             print(f"    ‹heard› {heard!r}")
         return heard
 
-    def deliver_finished_work():
+    def deliver_finished_work(self):
         """Come back with the answer to something that was running.
 
         Phrased through the brain rather than read out raw, so it arrives as
         "that search is done — Python 3.14" instead of a wall of text.
         """
         done = jobs.collect()
-        if not done or speaker.is_busy():
+        if not done or self.speaker.is_busy():
             return False
         for job in done:
             print(f"\n  ✓ {job['label']} finished ({job['took']:.0f}s)")
             live.set_phase("speaking", job["label"])
             try:
-                turn(brain.respond, history,
+                turn(brain.respond, self.history,
                      f"[The {job['label']} you started has finished. Result: "
                      f"{job['result']}] Tell me the answer briefly, as if coming back "
                      f"to me about it.",
                      on_delta=lambda piece: (print(piece, end="", flush=True),
-                                             speaker.feed(piece))[0],
+                                             self.speaker.feed(piece))[0],
                      on_tool=lambda name, args: None,
                      confirm=lambda summary: False,
+                     cfg=brain.spoken(),
                      backend_override="ollama")
-                speaker.flush()
-                speaker.wait()
+                self.speaker.flush()
+                self.speaker.wait()
                 print()
             except Exception as exc:
                 rails.log("JOB", f"could not announce: {exc}")
-            mic.flush()
+            self.mic.flush()
             live.set_phase("idle")
         return True
 
-    def spoke(text):
+    def spoke(self, text):
         """Say something outside a turn AND remember having said it.
 
         A question asked out loud that never entered history — "want me to
         remember that for good?" — meant the user's answer landed on a model
         that had no idea anything had been asked.
         """
-        speaker.say_now(text)
-        history.append({"role": "assistant", "content": text})
+        self.speaker.say_now(text)
+        self.history.append({"role": "assistant", "content": text})
 
-    def pending_notices():
+    def pending_notices(self):
         """Say anything the heartbeat is holding, while the mic is live."""
-        if speaker.is_busy() or rails.is_paused():
+        if self.speaker.is_busy() or rails.is_paused():
             return False
         import heartbeat
 
-        delivered = heartbeat.deliver_pending(spoke)
+        delivered = heartbeat.deliver_pending(self.spoke)
         if delivered:
-            speaker.wait()
-            mic.flush()
+            self.speaker.wait()
+            self.mic.flush()
         return bool(delivered)
 
-    # The gate is settled on the MAIN thread, never the worker — it owns the
-    # mic, and a worker blocked on input() while you answer out loud deadlocks.
-    gate = Gate(settings["confirm_timeout"] + 15)
-
-    def settle_gate(request):
+    def settle_gate(self, request):
         request_id, summary = request
         print(f"\n  ⚠︎  {NAME} wants to: {summary}")
-        speaker.stop()
-        speaker.say_now(_spoken_gate(summary))
-        speaker.wait()
-        mic.flush()
+        self.speaker.stop()
+        self.speaker.say_now(_spoken_gate(summary))
+        self.speaker.wait()
+        self.mic.flush()
 
-        deadline, allowed = time.time() + settings["confirm_timeout"], False
+        deadline, allowed = time.time() + self.settings["confirm_timeout"], False
         while time.time() < deadline:
-            reply = listen(deadline, timed=False)
-            if not reply or speaker.sounds_like_me(reply):
+            reply = self.listen(deadline, timed=False)
+            if not reply or self.speaker.sounds_like_me(reply):
                 continue
-            if ears.matches_any(reply, settings["yes_words"]):
+            if ears.matches_any(reply, self.settings["yes_words"]):
                 allowed = True
                 break
-            if ears.matches_any(reply, settings["no_words"]):
+            if ears.matches_any(reply, self.settings["no_words"]):
                 break
-            speaker.say_now("Yes or no?")
-            speaker.wait()
-            mic.flush()
+            self.speaker.say_now("Yes or no?")
+            self.speaker.wait()
+            self.mic.flush()
 
-        if not gate.settle(request_id, allowed):
+        if not self.gate.settle(request_id, allowed):
             allowed = False          # its turn was interrupted while we asked
         print(f"      {'allowed' if allowed else 'denied'} by voice\n")
         if not allowed:
-            spoke("Alright, I won't.")
+            self.spoke("Alright, I won't.")
 
-    def answer(said):
+    def answer(self, said):
         """Answer one turn while staying open to being talked over."""
         print(f"you › {said}")
 
         # Deterministic commands never reach the model, and corrections are
         # noticed, through the one shared path every front end uses.
-        if instant := before_turn(
+        instant, rest = before_turn(
             said,
-            lambda note: spoke(f"You've told me more than once: {said!r}. "
+            lambda note: self.spoke(f"You've told me more than once: {said!r}. "
                                "Want me to remember that for good?"),
-            speak=spoke,
-        ):
+            speak=self.spoke,
+        )
+        if instant:
             print(f"{NAME} › {instant}\n")
-            history.append({"role": "user", "content": said})
-            speaker.reset_timing()
-            spoke(instant)
-            speaker.wait()
-            mic.flush()
+            self.history.append({"role": "user", "content": said})
+            self.speaker.reset_timing()
+            self.spoke(instant)
+            self.speaker.wait()
+            self.mic.flush()
+        if not rest:
             return ""
+        said = rest
 
         # The big brain takes about two seconds. Say something rather than
         # leaving a silence that reads as a failure.
         if brain.wants_deep(said):
-            spoke(CONFIG["deep"]["acknowledgement"])
+            self.spoke(CONFIG["deep"]["acknowledgement"])
 
         print(f"{NAME} › ", end="", flush=True)
-        speaker.reset_timing()
+        self.speaker.reset_timing()
         interrupted = threading.Event()
         outcome = {"error": None}
 
         def on_delta(piece):
             if interrupted.is_set():
                 return
-            marks.setdefault("first_token", time.time())
+            self.marks.setdefault("first_token", time.time())
             print(piece, end="", flush=True)
-            speaker.feed(piece)
+            self.speaker.feed(piece)
 
         def streaming_response(messages, specs, deltas, cfg=None, backend=None):
             return brain.respond(messages, specs, deltas, cfg, backend,
@@ -681,10 +692,11 @@ def wake_main():
 
         def run_turn():
             try:
-                turn(streaming_response, history, said,
+                turn(streaming_response, self.history, said,
                      on_delta=on_delta,
                      on_tool=lambda name, args: print(f"\n  · {name}({_short(args)})"),
-                     confirm=lambda summary: gate.ask(summary, cancelled=interrupted.is_set),
+                     confirm=lambda summary: self.gate.ask(summary, cancelled=interrupted.is_set),
+                     cfg=brain.spoken(),
                      on_route=lambda backend, why: print(f"[{backend}]  ", end="", flush=True),
                      backend_override=CONFIG["voice"].get("backend"),
                      cancelled=interrupted.is_set)
@@ -694,144 +706,161 @@ def wake_main():
                 outcome["error"] = exc
             finally:
                 if not interrupted.is_set():
-                    speaker.flush()
+                    self.speaker.flush()
 
         worker = threading.Thread(target=run_turn, daemon=True)
         worker.start()
 
-        if not settings.get("barge_in", False):
-            mic.muted = True
+        if not self.settings.get("barge_in", False):
+            self.mic.muted = True
             while worker.is_alive():
-                if request := gate.next_request():
-                    mic.muted = False
-                    settle_gate(request)
-                    mic.muted = True
+                if request := self.gate.next_request():
+                    self.mic.muted = False
+                    self.settle_gate(request)
+                    self.mic.muted = True
                 worker.join(timeout=0.2)
-            speaker.wait()
-            mic.muted = False
-            mic.flush()
+            self.speaker.wait()
+            self.mic.muted = False
+            self.mic.flush()
         else:
-            minimum = settings.get("barge_in_min_words", 2)
-            while worker.is_alive() or speaker.is_busy():
-                if request := gate.next_request():
-                    settle_gate(request)
+            minimum = self.settings.get("barge_in_min_words", 2)
+            while worker.is_alive() or self.speaker.is_busy():
+                if request := self.gate.next_request():
+                    self.settle_gate(request)
                     continue
-                mic.duck_db = settings["barge_in_duck_db"] if speaker.is_busy() else 0.0
-                heard = listen(time.time() + 0.4, timed=False)
+                self.mic.duck_db = self.settings["barge_in_duck_db"] if self.speaker.is_busy() else 0.0
+                heard = self.listen(time.time() + 0.4, timed=False)
                 if not heard:
                     continue
+                # "Wait" is one word, and interrupting normally needs four while
+                # it talks. The thing you most need to say mid-reply was the one
+                # thing that could never land — so aborts skip the count.
+                if (ears.says_only(heard, self.settings["abort_words"], self.settings["abort_max_words"])
+                        and not self.speaker.sounds_like_me(heard)):
+                    self.mic.duck_db = 0.0
+                    interrupted.set()
+                    self.gate.revoke_all()
+                    self.speaker.stop()
+                    worker.join(timeout=2)
+                    print(f"\n  ↳ stopped ({heard!r})")
+                    return ""
                 # While it is speaking, demand more words: its own voice returns
                 # as short mangled fragments no echo test catches reliably.
-                needed = minimum if not speaker.is_busy() else max(
-                    minimum, settings["barge_in_while_speaking_words"])
-                if len(heard.split()) < needed or speaker.sounds_like_me(heard):
+                needed = minimum if not self.speaker.is_busy() else max(
+                    minimum, self.settings["barge_in_while_speaking_words"])
+                if len(heard.split()) < needed or self.speaker.sounds_like_me(heard):
                     continue
-                mic.duck_db = 0.0
+                self.mic.duck_db = 0.0
                 interrupted.set()
-                gate.revoke_all()       # a yes for the old turn must not survive
-                speaker.stop()
+                self.gate.revoke_all()       # a yes for the old turn must not survive
+                self.speaker.stop()
                 worker.join(timeout=2)
                 print("\n  ↳ interrupted")
                 return heard
             worker.join()
-            mic.duck_db = 0.0
+            self.mic.duck_db = 0.0
 
         if outcome["error"]:
-            speaker.stop()
+            self.speaker.stop()
             print(f"\n[couldn't reach the brain: {outcome['error']}]\n")
             return ""
         print("\n")
-        speaker.wait()
-        mic.flush()   # drop whatever it heard of itself
+        self.speaker.wait()
+        self.mic.flush()   # drop whatever it heard of itself
         return ""
 
-    print(f'\nOpen mic. Say "{phrase}" to wake me.')
-    print(f'I keep listening for {settings["follow_up_seconds"]}s after each reply.')
-    print('Ask me to "keep listening" to stay awake, and "bye bye" to stop.\n')
-    live.claim_mic()
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+    def run(self):
+        print(f'\nOpen mic. Say "{self.phrase}" to wake me.')
+        print(f'I keep listening for {self.settings["follow_up_seconds"]}s after each reply.')
+        print('Ask me to "keep listening" to stay awake, and "bye bye" to stop.\n')
+        live.claim_mic()
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
-    awake = staying = False
-    pending = ""
-    try:
-        while True:
-            if rails.is_paused():
-                live.set_phase("idle")
-                awake = staying = False
-                time.sleep(2)
-                continue
-
-            if not awake:
-                live.set_phase("listening", f'asleep — say "{phrase}"')
-                heard = listen()
-                if not heard:
+        awake = staying = False
+        pending = ""
+        try:
+            while True:
+                if rails.is_paused():
+                    live.set_phase("idle")
+                    awake = staying = False
+                    time.sleep(2)
                     continue
-                spoken = ears.find_wake(heard)
-                if spoken is None:
-                    near = ears.best_near_miss(heard)
-                    if near and settings["similarity"] - 0.22 <= near[1] < settings["similarity"]:
-                        rails.log("WAKE-MISS", f"{near[0]!r} ({near[1]:.2f})")
-                    deliver_finished_work() or pending_notices()
+
+                if not awake:
+                    live.set_phase("listening", f'asleep — say "{self.phrase}"')
+                    heard = self.listen()
+                    if not heard:
+                        continue
+                    spoken = ears.find_wake(heard)
+                    if spoken is None:
+                        near = ears.best_near_miss(heard)
+                        if near and self.settings["similarity"] - 0.22 <= near[1] < self.settings["similarity"]:
+                            rails.log("WAKE-MISS", f"{near[0]!r} ({near[1]:.2f})")
+                        self.deliver_finished_work() or self.pending_notices()
+                        continue
+                    awake = True
+                    print(f'  ◉ awake ("{self.phrase}")')
+                    if len(spoken.split()) < 2:
+                        # Listen before prompting. People say the name and the
+                        # question in one breath, and saying "Yes?" here flushes the
+                        # microphone — throwing away the half you actually wanted.
+                        # This fix was written once and lost in the move to
+                        # streaming; REG-14 is why it came back.
+                        spoken = self.listen(time.time() + CONFIG["wake"]["question_wait_seconds"] * 2)
+                        if trailing := ears.find_wake(spoken):
+                            spoken = trailing
+                        if not spoken:
+                            self.speaker.say_now("Yes?")
+                            self.speaker.wait()
+                            self.mic.flush()
+                else:
+                    spoken, pending = pending, ""
+
+                if not spoken:
+                    until = None if staying else time.time() + self.settings["follow_up_seconds"]
+                    live.set_phase("listening", "in conversation — go ahead"
+                                   if staying else "listening for your reply")
+                    spoken = self.listen(until)
+
+                if not spoken:
+                    self.deliver_finished_work()
+                    print(f'  ○ back to sleep — say "{self.phrase}" to wake me\n')
+                    awake = staying = False
+                    live.set_phase("idle")
                     continue
-                awake = True
-                print(f'  ◉ awake ("{phrase}")')
-                if len(spoken.split()) < 2:
-                    # Listen before prompting. People say the name and the
-                    # question in one breath, and saying "Yes?" here flushes the
-                    # microphone — throwing away the half you actually wanted.
-                    # This fix was written once and lost in the move to
-                    # streaming; REG-14 is why it came back.
-                    spoken = listen(time.time() + CONFIG["wake"]["awake_chunk_seconds"] * 2)
-                    if trailing := ears.find_wake(spoken):
-                        spoken = trailing
-                    if not spoken:
-                        speaker.say_now("Yes?")
-                        speaker.wait()
-                        mic.flush()
-            else:
-                spoken, pending = pending, ""
 
-            if not spoken:
-                until = None if staying else time.time() + settings["follow_up_seconds"]
-                live.set_phase("listening", "in conversation — go ahead"
-                               if staying else "listening for your reply")
-                spoken = listen(until)
+                if ears.says_only(spoken, self.settings["goodbyes"], self.settings["goodbye_max_words"]):
+                    print(f'  ○ "{spoken}" — back to sleep\n')
+                    self.speaker.say_now("Alright. Say my name when you need me.")
+                    self.speaker.wait()
+                    self.mic.flush()
+                    awake = staying = False
+                    live.set_phase("idle")
+                    continue
 
-            if not spoken:
-                deliver_finished_work()
-                print(f'  ○ back to sleep — say "{phrase}" to wake me\n')
-                awake = staying = False
-                live.set_phase("idle")
-                continue
+                if not staying and ears.matches_any(spoken, self.settings["stay_awake"]):
+                    staying = True
+                    print("  ∞ staying awake until you say bye\n")
+                    rails.log("MIC", "staying awake for a long conversation")
 
-            if ears.matches_any(spoken, settings["goodbyes"]):
-                print(f'  ○ "{spoken}" — back to sleep\n')
-                speaker.say_now("Alright. Say my name when you need me.")
-                speaker.wait()
-                mic.flush()
-                awake = staying = False
-                live.set_phase("idle")
-                continue
+                pending = self.answer(spoken)
+                if self.speaker.first_audio:
+                    self.marks["first_audio"] = self.speaker.first_audio
+                    report_stages(self.marks, self.speaker)
+                self.marks.clear()
+        except KeyboardInterrupt:
+            print()
+        finally:
+            self.mic.close()
+            live.release_mic()
+        self.speaker.close()
+        live.set_phase("idle")
+        _release()
+        print(f"{NAME} out.")
 
-            if not staying and ears.matches_any(spoken, settings["stay_awake"]):
-                staying = True
-                print("  ∞ staying awake until you say bye\n")
-                rails.log("MIC", "staying awake for a long conversation")
 
-            pending = answer(spoken)
-            if speaker.first_audio:
-                marks["first_audio"] = speaker.first_audio
-                report_stages(marks, speaker)
-            marks.clear()
-    except KeyboardInterrupt:
-        print()
-    finally:
-        mic.close()
-        live.release_mic()
-    speaker.close()
-    live.set_phase("idle")
-    _release()
-    print(f"{NAME} out.")
+def wake_main():
+    VoiceLoop().run()
 
 
 def misses_main():
@@ -965,18 +994,22 @@ class Gate:
 def before_turn(text, on_note, speak=None):
     """What every front end must do before the model sees a turn.
 
-    Three front ends each hand-rolled this and voice_main quietly fell behind —
-    it never learned a correction, never answered a timer, never mentioned
-    finished background work. One function, so drift is not possible.
-
-    Returns a reply if the turn was answered without the model, else None.
+    Returns (reply, rest). `reply` is anything answered without the model;
+    `rest` is what still needs it, or None. Returning only a reply used to drop
+    the remainder of the sentence: "what time is it and what's on my todo list"
+    got the time, and the todo list vanished.
     """
+    import ears
+
+    if ears.says_only(text, CONFIG["wake"]["abort_words"], CONFIG["wake"]["abort_max_words"]):
+        return "Okay.", None            # "never mind" is not a prompt
+
     if corrections.looks_like_correction(text):
         if ready := corrections.note(text):
             corrections.mark_offered(ready["key"])
             on_note(f"you've said that {ready['times']}x — I can remember it for good")
 
-    return reflex.handle(text, on_fire=speak)
+    return reflex.split(text, on_fire=speak)
 
 
 def check_fence():
@@ -1016,16 +1049,22 @@ def _short(arguments, limit=60):
 
 def selftest():
     """Checks run against throwaway state — never the real store or audit log."""
+    import isolation
+
+    with isolation.isolated_state():
+        _selftest()
+
+
+def _selftest():
     import tempfile as _tf
     from pathlib import Path as _P
 
-    import live as _live
-    import rails as _rails
+    import isolation as _isolation
 
-    _sandbox = _tf.TemporaryDirectory()
-    _rails.LOG = _P(_sandbox.name) / "audit.log"
-    _rails.PAUSED = _P(_sandbox.name) / "PAUSED"
-    _live.FILE = _P(_sandbox.name) / "live.json"
+    assert not _isolation.unisolated_paths(), _isolation.unisolated_paths()
+    # A fresh clone has an empty store; assertions must not depend on the
+    # owner's real todo list, which is how this used to pass only on one laptop.
+    tools.save_todos([{"id": 1, "text": "buy oat milk", "due": None, "done": False}])
 
     seen = []
 
@@ -1261,7 +1300,6 @@ def selftest():
     assert privacy.sandbox_works(), "seatbelt sandbox is not blocking private paths"
     assert privacy.confine(["x"])[0] == "sandbox-exec"
 
-    _sandbox.cleanup()
     print("selftest ok")
 
 

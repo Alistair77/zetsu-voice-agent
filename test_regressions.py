@@ -25,11 +25,36 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import corrections
 import ears
+import isolation
 import mouth
 import privacy
 import tools
 import zetsu
 from config import CONFIG
+
+def _fingerprint_real_state():
+    """Hash every file in the real state directory. Isolation moves the modules'
+    paths, not STATE itself, so this can be read at any time."""
+    import hashlib
+
+    from config import STATE
+
+    return {
+        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(STATE.glob("*")) if p.is_file()
+    }
+
+
+# Taken before anything runs, compared after everything has — the whole suite
+# is held to the same rule as each test.
+_REAL_BEFORE = _fingerprint_real_state()
+
+# Every test below runs the moment it is defined, so the isolation has to be in
+# place before the first one. Nothing here may touch the owner's real state.
+_ISOLATED = isolation.isolated_state()
+_ISOLATED.__enter__()
+assert not isolation.unisolated_paths(), isolation.unisolated_paths()
+tools.save_todos([{"id": 1, "text": "buy oat milk", "due": None, "done": False}])
 
 PASSED, FAILED = [], []
 
@@ -48,6 +73,10 @@ def check(number, what, structural=False):
 
 def source_of(function):
     return inspect.getsource(function)
+
+
+def voice_loop_source():
+    return inspect.getsource(zetsu.VoiceLoop)
 
 
 @check(1, "a blocked action can never read as success")
@@ -76,7 +105,7 @@ def _():
     assert outcome["silent"] is False, "an unanswered gate must refuse"
     assert _time.time() - started < 2, "the worker hung instead of timing out"
 
-    body = source_of(zetsu.wake_main)
+    body = voice_loop_source()
     assert "gate.ask(" in body and "settle_gate(request)" in body
     assert "input(" not in source_of(zetsu.Gate), "the gate must never read the keyboard"
 
@@ -88,10 +117,17 @@ def _():
     assert stubborn.poll() is not None, "stubborn recorder survived"
 
 
-@check(4, "a dropped microphone is closed, not leaked", structural=True)
+@check(4, "a dropped microphone is closed, not leaked")
 def _():
-    assert "mic.close()" in source_of(zetsu.wake_main)
-    assert hasattr(ears.StreamMic, "close") and hasattr(ears.OpenMic, "close")
+    # Was structural and asserted OpenMic still existed — pinning dead code. The
+    # real guarantee: a stream that is closed releases its capture process.
+    import subprocess as _sp
+
+    mic = ears.StreamMic.__new__(ears.StreamMic)
+    mic.process = _sp.Popen(["sleep", "60"])
+    mic.close()
+    assert mic.process.poll() is not None, "close() left the capture process running"
+    assert "mic.close()" in voice_loop_source(), "the session never closes it"
 
 
 @check(5, "notes search actually runs")
@@ -134,18 +170,39 @@ def _():
     assert not mic.is_echo(other.astype(np.int16).tobytes(), 0.0), "false echo alarm"
 
 
-@check(8, "tests never write to the real store or audit log", structural=True)
+@check(8, "tests never write to the real store or audit log")
 def _():
-    body = source_of(zetsu.selftest)
-    for pointed in ("_rails.LOG", "_rails.PAUSED", "_live.FILE"):
-        assert pointed in body, f"{pointed} not sandboxed"
-    assert "TemporaryDirectory" in body
+    # This once checked that selftest's source *mentioned* three paths, and the
+    # regression suite then wrote into the real audit log anyway. Its first
+    # replacement exited and re-entered the shared isolation to measure — which
+    # a generator context manager cannot do, so every later test ran against
+    # real state. The real directory is readable without leaving isolation.
+    assert not isolation.unisolated_paths(), isolation.unisolated_paths()
+    before = _fingerprint_real_state()
+    zetsu.selftest()
+    after = _fingerprint_real_state()
+    changed = {name for name in set(before) | set(after) if before.get(name) != after.get(name)}
+    assert not changed, f"selftest changed real state: {sorted(changed)}"
 
 
-@check(9, "latency marks can never read negative", structural=True)
+@check(9, "latency marks can never read negative")
 def _():
-    body = source_of(zetsu.wake_main)
-    assert body.count("timed=False") >= 2, "non-turn listens must not stamp the marks"
+    # Was a string search for "timed=False". With the loop a class, test it: a
+    # barge-in poll must not overwrite the timestamps of the turn being measured.
+    loop = zetsu.VoiceLoop.__new__(zetsu.VoiceLoop)
+    loop.settings = dict(CONFIG["wake"], show_chunks=False)
+    loop.marks = {"stt": 100.0}
+
+    class FakeMic:
+        speech_ended, transcript_at = 200.0, 250.0
+        def next_utterance(self, deadline=None):
+            return "stop that"
+
+    loop.mic = FakeMic()
+    loop.listen(timed=False, allow_continuation=False)
+    assert loop.marks == {"stt": 100.0}, f"a poll stamped the turn: {loop.marks}"
+    loop.listen(timed=True, allow_continuation=False)
+    assert loop.marks["stt"] == 250.0, "a real turn failed to record its timing"
 
 
 @check(10, "audio capture runs with low-latency flags", structural=True)
@@ -155,13 +212,15 @@ def _():
         assert flag in body, f"missing {flag}: ~1.5s of buffering returns without it"
 
 
-@check(11, "the wake word survives landing on a boundary")
+@check(11, "the wake word is not clipped off the start of an utterance")
 def _():
-    assert CONFIG["wake"]["chunk_overlap_seconds"] > 0
-    assert CONFIG["wake"]["chunk_seconds"] >= 2.0
+    # The original bug was fixed-length slices chopping "Friday" into "Day". There
+    # are no slices now; the equivalent failure is the voice detector starting a
+    # recording a moment after speech began. Pre-roll keeps the onset.
+    assert CONFIG["stream"]["preroll_ms"] >= 200, "too little audio kept before speech began"
     assert ears.find_wake("Friday what is on my list") == "what is on my list"
-    assert ears.find_wake("fridey add milk") == "add milk"
-    assert ears.find_wake("on tuesday i went out") is None
+    assert ears.find_wake("fridey add milk") == "add milk", "near-miss must still wake"
+    assert ears.find_wake("on tuesday i went out") is None, "false wake"
 
 
 @check(12, "an apostrophe never splits a word in two")
@@ -175,12 +234,12 @@ def _():
 def _():
     body = source_of(mouth.Speaker.close)
     assert "join" in body and "self.piper = None" in body
-    assert "speaker.close()" in source_of(zetsu.wake_main)
+    assert "speaker.close()" in voice_loop_source()
 
 
 @check(14, "waking on the bare name never mutes away the question", structural=True)
 def _():
-    body = source_of(zetsu.wake_main)
+    body = voice_loop_source()
     branch = body.find("len(spoken.split()) < 2")
     prompt_at = body.find('say_now("Yes?")', branch)
     listen_at = body.find("hear_a_sentence(", branch)
@@ -248,11 +307,11 @@ def _():
 
 @check(21, "every front end shares one pre-turn path, so none can drift")
 def _():
-    import reflex
-
-    assert zetsu.before_turn("what time is it", lambda note: None), "time not answered"
-    assert zetsu.before_turn("tell me something interesting", lambda note: None) is None
-    for name in ("main", "voice_main", "wake_main"):
+    reply, rest = zetsu.before_turn("what time is it", lambda note: None)
+    assert reply and rest is None, (reply, rest)
+    reply, rest = zetsu.before_turn("tell me something interesting", lambda note: None)
+    assert reply is None and rest == "tell me something interesting", (reply, rest)
+    for name in ("main", "voice_main", "VoiceLoop"):
         body = source_of(getattr(zetsu, name))
         assert "before_turn(" in body, f"{name} bypasses the shared path"
         assert "reflex.handle" not in body, f"{name} re-implements it again"
@@ -321,7 +380,7 @@ def _():
         privacy.sandbox_works = real_works
         tools.REGISTRY.clear()
         tools.REGISTRY.update(saved)
-    for name in ("main", "voice_main", "wake_main"):
+    for name in ("main", "voice_main", "VoiceLoop"):
         assert "check_fence()" in source_of(getattr(zetsu, name)), f"{name} skips the fence"
 
 
@@ -358,12 +417,19 @@ def _():
     assert history[0]["role"] == "user", "trimmed mid-exchange"
 
 
-@check(28, "anything said out loud outside a turn is remembered as said", structural=True)
+@check(28, "anything said out loud outside a turn is remembered as said")
 def _():
-    body = source_of(zetsu.wake_main)
-    assert "def spoke(" in body and "history.append" in body
-    assert "deliver_pending(spoke)" in body, "heartbeat notices bypass history"
-    assert "spoke(CONFIG[\"deep\"]" in body or "spoke(CONFIG['deep']" in body
+    # Was a string search. Now: call it, and look at the history.
+    loop = zetsu.VoiceLoop.__new__(zetsu.VoiceLoop)
+    said = []
+    loop.speaker = type("S", (), {"say_now": lambda self, text: said.append(text)})()
+    loop.history = []
+    loop.spoke("Want me to remember that for good?")
+    assert said == ["Want me to remember that for good?"], "it was not spoken"
+    assert loop.history == [{"role": "assistant",
+                             "content": "Want me to remember that for good?"}], loop.history
+    body = voice_loop_source()
+    assert "deliver_pending(self.spoke)" in body, "heartbeat notices bypass history"
 
 
 @check(29, "the speaker is not busy once its process has finished")
@@ -427,7 +493,110 @@ def _():
     assert late is False, "a stale answer was accepted"
 
 
+# --- from the audit: the medium tier -----------------------------------------
+
+@check(33, "the selftest passes on a fresh clone, not just on the owner's laptop")
+def _():
+    # It once asserted "oat milk" was on the list — true only because the
+    # owner's real todo list said so. A clone started empty and failed.
+    tools.save_todos([])
+    zetsu.selftest()            # must seed whatever it asserts on
+
+
+@check(34, "answering part of a sentence hands back the rest")
+def _():
+    import reflex
+
+    reply, rest = reflex.split("what time is it and what is on my todo list")
+    assert reply and rest == "what is on my todo list", (reply, rest)
+    reply, rest = reflex.split("set a timer for ten minutes")
+    assert reply and rest is None, (reply, rest)
+    reply, rest = reflex.split("tell me a joke")
+    assert reply is None and rest == "tell me a joke"
+
+
+@check(35, "a sentence containing a goodbye is not a goodbye")
+def _():
+    goodbyes, limit = CONFIG["wake"]["goodbyes"], CONFIG["wake"]["goodbye_max_words"]
+    assert not ears.says_only("I'm finished with the draft, what's next?", goodbyes, limit)
+    assert not ears.says_only("that is all for the milk, add bread too", goodbyes, limit)
+    assert ears.says_only("bye bye", goodbyes, limit)
+    assert ears.says_only("okay, I'm done for the day", goodbyes, limit)
+
+
+@check(36, "a one-word 'wait' can stop it, and 'never mind' is not a prompt")
+def _():
+    aborts, limit = CONFIG["wake"]["abort_words"], CONFIG["wake"]["abort_max_words"]
+    for word in ("wait", "stop", "never mind", "hold on"):
+        assert ears.says_only(word, aborts, limit), word
+    assert not ears.says_only("wait until the build finishes then deploy it", aborts, limit)
+    assert zetsu.before_turn("never mind", lambda note: None) == ("Okay.", None)
+    body = voice_loop_source()
+    abort_at = body.find('settings["abort_words"]', body.find("def answer"))
+    count_at = body.find("len(heard.split()) < needed", body.find("def answer"))
+    assert 0 < abort_at < count_at, "aborts must be checked before the word count"
+
+
+@check(37, "a spoken turn is told it is spoken, and that its input is a transcript")
+def _():
+    import brain
+
+    heard = brain.system_prompt(brain.spoken())
+    typed = brain.system_prompt()
+    assert "spoken aloud" in heard and "transcript" in heard
+    assert "spoken aloud" not in typed, "typed turns must not be told to be brief for listening"
+    assert "cfg=brain.spoken()" in source_of(zetsu.voice_main)
+    assert "cfg=brain.spoken()" in voice_loop_source()
+
+
+@check(38, "asking the bigger model does not freeze the conversation")
+def _():
+    assert tools.REGISTRY["think_harder"]["slow"] >= CONFIG["jobs"]["background_over_seconds"], \
+        "think_harder would run inline and leave the voice loop silent"
+
+
+@check(39, "the dashboard cannot start two open-mic loops at once")
+def _():
+    import os as _os
+
+    import dash
+    import live
+
+    live.PID.unlink(missing_ok=True)
+    spawned, real_popen, real_resume = [], dash.subprocess.Popen, dash.rails.resume
+
+    class Child:
+        pid = _os.getpid()            # alive, so mic_pid() believes it; nothing is spawned
+        def __init__(self, *args, **kwargs):
+            spawned.append(self)
+            import time as _t; _t.sleep(0.15)
+
+    dash.subprocess.Popen, dash.rails.resume = Child, (lambda: None)
+    try:
+        clicks = [threading.Thread(target=dash.control, args=("start",)) for _ in range(6)]
+        for c in clicks: c.start()
+        for c in clicks: c.join()
+    finally:
+        dash.subprocess.Popen, dash.rails.resume = real_popen, real_resume
+    assert len(spawned) == 1, f"{len(spawned)} loops started from six simultaneous clicks"
+
+    live.claim_mic(pid=999999)        # someone else's claim
+    live.release_mic()
+    assert live.PID.exists(), "one process deleted another's claim on the microphone"
+    live.PID.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
+    _ISOLATED.__exit__(None, None, None)
+    _changed = {
+        name for name in set(_REAL_BEFORE) | set(_fingerprint_real_state())
+        if _REAL_BEFORE.get(name) != _fingerprint_real_state().get(name)
+    }
+    if _changed:
+        FAILED.append(("REG-00  the suite as a whole left real state untouched",
+                       f"changed: {sorted(_changed)}"))
+    else:
+        PASSED.insert(0, "REG-00  the suite as a whole left real state untouched")
     for line in PASSED:
         print(f"  pass  {line}")
     for line, why in FAILED:

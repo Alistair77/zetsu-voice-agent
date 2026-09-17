@@ -37,10 +37,35 @@ def system_prompt(cfg=CONFIG):
         "so — 'That did not work', 'It did NOT run', 'running in the background'. "
         "Read what the result actually says: never report something as done when "
         "the result told you it failed, was refused, or has not finished yet.\n"
+        f"{spoken_rules(cfg)}"
         "When the user tells you something durable about themselves — a "
         "preference, a name, a decision — call remember so you still know it "
         "next time."
     )
+
+
+SPOKEN = (
+    "This conversation is spoken aloud, not read. One or two sentences unless "
+    "they ask for more. No lists, no markdown, no links, no emoji — none of it "
+    "can be heard.\n"
+    "What you receive is a speech transcript and can contain misheard words. If "
+    "a word makes no sense, go with the most likely meaning; if the meaning "
+    "genuinely depends on it, ask one short question rather than guess.\n"
+)
+
+
+def spoken_rules(cfg):
+    """Typed and spoken turns used to get byte-identical instructions.
+
+    Carried on the config rather than as a new argument to respond(), so the
+    seam every backend and every test double implements does not change.
+    """
+    return SPOKEN if cfg.get("spoken_turn") else ""
+
+
+def spoken(cfg=CONFIG):
+    """The config for a turn that will be heard rather than read."""
+    return {**cfg, "spoken_turn": True}
 
 
 def route(text, cfg=CONFIG):

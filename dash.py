@@ -28,6 +28,10 @@ import rails
 import tools
 from config import CONFIG, NAME, ROOT as ROOT_DIR, STATE as STATE_DIR
 
+# The dashboard serves requests on several threads, so two clicks on Start can
+# both see "not running" at the same moment. This makes check-then-spawn atomic.
+START_LOCK = __import__("threading").Lock()
+
 COST = re.compile(r"claude-cli \$([0-9.]+)")
 
 PAGE = r"""<!doctype html>
@@ -355,14 +359,19 @@ def control(action):
     """
     running = live.mic_pid()
     if action == "start":
-        if running:
-            return {"ok": True, "note": "already listening"}
-        logfile = (STATE_DIR / "wake.log").open("a")
-        subprocess.Popen(
-            [sys.executable, "-u", str(ROOT_DIR / "zetsu.py"), "--wake"],
-            cwd=str(ROOT_DIR), stdout=logfile, stderr=logfile,
-            stdin=subprocess.DEVNULL, start_new_session=True,
-        )
+        with START_LOCK:
+            # The child only claimed the mic after loading its models — tens of
+            # seconds in which a second click saw nothing running and started
+            # another. Claim for it the moment it exists.
+            if live.mic_pid():
+                return {"ok": True, "note": "already listening"}
+            logfile = (STATE_DIR / "wake.log").open("a")
+            child = subprocess.Popen(
+                [sys.executable, "-u", str(ROOT_DIR / "zetsu.py"), "--wake"],
+                cwd=str(ROOT_DIR), stdout=logfile, stderr=logfile,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+            live.claim_mic(child.pid)
         rails.resume()
         rails.log("MIC", "started from the dashboard")
         return {"ok": True}

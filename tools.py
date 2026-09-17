@@ -499,6 +499,7 @@ def draft_email(to, subject, body):
     "Ask a much larger model. Use this when the question needs real reasoning, "
     "when you are genuinely unsure of the answer, or when getting it wrong would "
     "matter. Do not use it for anything you already know — it is slower.",
+    slow=8,   # was inline: several silent seconds while the voice loop waited
     question="The question, written out in full with everything needed to answer it.",
 )
 def think_harder(question):

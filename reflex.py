@@ -64,6 +64,33 @@ def _count(words):
     return total or None
 
 
+# Words that join two requests and carry no request of their own.
+JOINERS = re.compile(r"^(?:and|also|then|plus|oh|and also|and then|,|\.|\?)+\s*", re.I)
+
+
+def split(text, on_fire=None):
+    """Answer the deterministic part of `text`; return (reply, what is left).
+
+    "What time is it and what's on my todo list" used to be answered with the
+    time alone — the rest of the sentence was silently dropped, because this
+    returned a reply and nothing else. Whatever a command does not cover is
+    handed back so the model can deal with it.
+    """
+    for pattern in (TIME_ASK, DATE_ASK, TIMER):
+        found = pattern.search(text)
+        if not found:
+            continue
+        reply = handle(found.group(0), on_fire=on_fire)
+        if reply is None:
+            continue
+        rest = (text[: found.start()] + " " + text[found.end():]).strip(" ,.?!")
+        rest = JOINERS.sub("", rest).strip(" ,.?!")
+        meaningful = [w for w in re.findall(r"[a-z']+", rest.lower())
+                      if w not in {"is", "it", "the", "a", "please", "now", "for"}]
+        return reply, (rest if len(meaningful) >= 2 else None)
+    return None, text
+
+
 def handle(text, on_fire=None):
     """Return a spoken reply if this is a deterministic command, else None."""
     if not CONFIG["reflex"]["enabled"]:
